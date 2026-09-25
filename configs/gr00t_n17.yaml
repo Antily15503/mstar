@@ -1,0 +1,12 @@
+model: "gr00t_n17"
+max_seq_len: 1024
+
+# Single-GPU: all 3 nodes on rank 0. Grouping is cosmetic here (only matters
+# once nodes sit on different ranks); split backbone / heads for readability.
+# 3 nodes, not 4 — GR00T's vision tower lives inside the Cosmos-Reason2-2B
+# (Qwen3-VL) backbone, so there is no standalone image-encoder node.
+node_groups:
+  - node_names: [vlm]
+    ranks: [0]
+  - node_names: [state_encoder, dit]
+    ranks: [0]

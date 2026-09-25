@@ -32,6 +32,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
     "z_image_turbo": ("mstar.model.z_image.z_image_model", "ZImageModel"),
+    "gr00t_n17": ("mstar.model.gr00t_n17.gr00t_n17_model", "Gr00tN17Model"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -121,6 +122,10 @@ HF_MODELS: dict[str, dict] = {
     # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
     # FLUX.1 VAE), text-to-image only. Apache-2.0.
     "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
+    # GR00T N1.7 (3B) VLA policy: Cosmos-Reason2-2B VLM backbone (Qwen3-VL
+    # architecture) + flow-matching DiT action head (4 inference steps, 40-step
+    # horizon, up to 32 embodiments). Continuous actions, no sampler.
+    "gr00t_n17": {"model_path_hf": "nvidia/GR00T-N1.7-3B"},
 }
 
 # qwen 3.5 family: dense (MoE TODO)
