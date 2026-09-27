@@ -5,6 +5,7 @@ builds a valid walk graph (3 nodes, prefill Parallel -> denoise Loop).
 Components: the state_encoder is real and exercised end to end; vlm and dit are
 still stubbed (Phase 3), so their forward compute is not covered here."""
 
+import pytest
 import torch
 
 from mstar.graph.base import Loop, Parallel
@@ -108,6 +109,38 @@ def test_state_encoder_end_to_end_through_submodule():
     out = sub.forward("prefill", None, **kwargs)
     assert list(out) == ["state_features"]
     assert out["state_features"][0].shape == (1, cfg.input_embedding_dim)
+
+
+def test_action_encoder_shapes_and_timestep_dependence():
+    """MultiEmbodimentActionEncoder: [B, T, action_dim] + [B] timesteps
+    -> [B, T, hidden]. Output must depend on the timestep (it is how the DiT
+    knows where it is in the denoise schedule)."""
+    from mstar.model.gr00t_n17.components.embodiment_mlp import (
+        MultiEmbodimentActionEncoder,
+    )
+
+    cfg = _model().config
+    enc = MultiEmbodimentActionEncoder(
+        action_dim=cfg.max_action_dim,
+        hidden_size=cfg.input_embedding_dim,
+        num_embodiments=cfg.max_num_embodiments,
+    )
+    actions = torch.randn(2, cfg.action_horizon, cfg.max_action_dim)
+    cat = torch.tensor([0, 1])
+    out = enc(actions, torch.tensor([0, 0]), cat)
+    assert out.shape == (2, cfg.action_horizon, cfg.input_embedding_dim)
+    later = enc(actions, torch.tensor([500, 500]), cat)
+    assert not torch.allclose(out, later)
+
+
+def test_action_encoder_rejects_bad_timestep_shape():
+    from mstar.model.gr00t_n17.components.embodiment_mlp import (
+        MultiEmbodimentActionEncoder,
+    )
+
+    enc = MultiEmbodimentActionEncoder(action_dim=8, hidden_size=16, num_embodiments=4)
+    with pytest.raises(ValueError, match="timesteps"):
+        enc(torch.randn(2, 5, 8), torch.randn(2, 5), torch.tensor([0, 1]))
 
 
 def test_state_encoder_defaults_embodiment_id_when_absent():

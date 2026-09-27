@@ -18,6 +18,32 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def swish(x: torch.Tensor) -> torch.Tensor:
+    """Swish / SiLU activation, kept as its own function to mirror the reference."""
+    return x * torch.sigmoid(x)
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal encoding of shape ``(B, T, embedding_dim)`` from timesteps ``(B, T)``.
+
+    Used to embed the flow-matching timestep before it is fused with the action
+    embedding. Standard log-spaced frequencies, sin and cos concatenated.
+    """
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        timesteps = timesteps.float()
+        half_dim = self.embedding_dim // 2
+        exponent = -torch.arange(half_dim, dtype=torch.float, device=timesteps.device) * (
+            torch.log(torch.tensor(10000.0)) / half_dim
+        )
+        freqs = timesteps.unsqueeze(-1) * exponent.exp()   # (B, T, half_dim)
+        return torch.cat([torch.sin(freqs), torch.cos(freqs)], dim=-1)
+
+
 class CategorySpecificLinear(nn.Module):
     """Linear layer with per-embodiment weights and biases.
 
@@ -74,3 +100,54 @@ class CategorySpecificMLP(nn.Module):
         """
         hidden = F.relu(self.layer1(x, cat_ids))
         return self.layer2(hidden, cat_ids)
+
+
+class MultiEmbodimentActionEncoder(nn.Module):
+    """Embeds a noisy action chunk together with its flow-matching timestep.
+
+    This is the first step of every denoise iteration in
+    ``Gr00tN1d7ActionHead.get_action_with_features``: it turns
+    ``(actions, timestep, embodiment_id)`` into the action tokens that get
+    concatenated with ``state_features`` to form the DiT's ``hidden_states``.
+
+    Structure (all three projections are embodiment-conditioned)::
+
+        a_emb   = W1(actions)                       # d -> w
+        tau_emb = sinusoidal(timestep)              # -> w
+        x       = swish(W2(cat[a_emb, tau_emb]))    # 2w -> w
+        out     = W3(x)                             # w -> w
+    """
+
+    def __init__(self, action_dim: int, hidden_size: int, num_embodiments: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_embodiments = num_embodiments
+        self.W1 = CategorySpecificLinear(num_embodiments, action_dim, hidden_size)
+        self.W2 = CategorySpecificLinear(num_embodiments, 2 * hidden_size, hidden_size)
+        self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
+
+    def forward(
+        self, actions: torch.Tensor, timesteps: torch.Tensor, cat_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            actions: ``[B, T, action_dim]``
+            timesteps: ``[B]`` -- one scalar timestep per request
+            cat_ids: ``[B]`` embodiment ids
+        Returns:
+            ``[B, T, hidden_size]``
+        """
+        B, T, _ = actions.shape
+        if timesteps.dim() != 1 or timesteps.shape[0] != B:
+            raise ValueError(
+                f"Expected timesteps of shape ({B},) so it can be replicated "
+                f"across the {T} action steps; got {tuple(timesteps.shape)}"
+            )
+        # One scalar timestep per request, replicated across the chunk: (B,) -> (B, T)
+        timesteps = timesteps.unsqueeze(1).expand(-1, T)
+
+        a_emb = self.W1(actions, cat_ids)
+        tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)
+        x = swish(self.W2(torch.cat([a_emb, tau_emb], dim=-1), cat_ids))
+        return self.W3(x, cat_ids)
