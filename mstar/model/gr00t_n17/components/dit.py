@@ -18,7 +18,8 @@ Euler step; the loop lives in the graph, not here.
 
 which is why it needs ``image_mask`` alongside the VLM features.
 
-Deliberate deviations from the reference (none affect numerics):
+Structural deviations from the reference (verified not to affect numerics --
+test/modular/test_gr00t_n17_dit_equivalence.py asserts bit-exact equality):
   * diffusers' ``ModelMixin``/``ConfigMixin``/``register_to_config`` plumbing is
     dropped -- mstar passes GR00TConfig values explicitly, so these are plain
     ``nn.Module``s and the ``self.config.X`` indirection goes away.
@@ -27,6 +28,23 @@ Deliberate deviations from the reference (none affect numerics):
     targets sm121.
   * ``return_all_hidden_states``, gradient checkpointing and the constructor's
     parameter-count ``print`` are omitted -- training/debug only.
+
+Behavioural / contract deviations (deliberate, and each pinned by a test):
+  * ``DiT.forward`` **honours** ``encoder_attention_mask``. The reference
+    accepts the argument and then hardcodes ``encoder_attention_mask=None`` on
+    every block call (ref dit.py:316,325), so upstream it is dead. Ours is the
+    better behaviour and is currently unreachable in serving -- nothing passes a
+    mask to the plain ``DiT``, and ``AlternateVLDiT`` derives its own -- so it
+    cannot change checkpoint numerics today. It would the moment a caller does.
+  * ``AlternateVLDiT.forward`` has a **different parameter order**: the dead
+    ``encoder_attention_mask`` and ``return_all_hidden_states`` are gone, so
+    ``image_mask`` moves up. Call it with KEYWORDS -- a positional call written
+    against the reference signature would silently bind ``image_mask`` to
+    ``timestep``.
+  * ``AlternateVLDiT`` requires ``backbone_attention_mask`` and raises
+    ``ValueError``; the reference would raise ``TypeError`` deeper in on
+    ``image_mask & None``. Stricter, with a better message.
+
 diffusers' ``Attention``/``FeedForward`` are kept (the reference uses them and
 mstar already depends on diffusers); see 06 - Gaps for when to revisit.
 """
