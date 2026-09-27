@@ -211,6 +211,18 @@ pi05 = [
     "triton",
 ]
 
+gr00t_n17 = [
+    # The action-head DiT reuses diffusers' Attention/FeedForward/Timesteps,
+    # matching the reference implementation (gr00t/model/modules/dit.py).
+    "diffusers>=0.39",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "safetensors",
+    # Qwen3-VL backbone (nvidia/Cosmos-Reason2-2B) is loaded via transformers.
+    "transformers",
+]
+
 vjepa2 = [
     "huggingface-hub",
     "mooncake-transfer-engine",
