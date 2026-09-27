@@ -38,9 +38,13 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.gr00t_n17.components.embodiment_mlp import CategorySpecificMLP
+from mstar.model.gr00t_n17.components.dit import AlternateVLDiT
+from mstar.model.gr00t_n17.components.embodiment_mlp import (
+    CategorySpecificMLP,
+    MultiEmbodimentActionEncoder,
+)
 from mstar.model.gr00t_n17.config import GR00TConfig, load_gr00t_config
-from mstar.model.gr00t_n17.submodules import Gr00tStateEncoderSubmodule
+from mstar.model.gr00t_n17.submodules import Gr00tDiTSubmodule, Gr00tStateEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -78,7 +82,12 @@ class Gr00tN17Model(Model):
         # separate its SigLIP `vit_encoder` from the LLM).
         self.vlm = None             # Cosmos-Reason2-2B backbone (vision + language)
         self.state_encoder = None   # CategorySpecificMLP, embodiment-indexed
+        # The dit node owns four modules: the transformer plus the action
+        # encoder/decoder that bracket it and the action position embedding.
         self.dit = None             # AlternateVLDiT flow-matching action head
+        self.action_encoder = None  # MultiEmbodimentActionEncoder
+        self.action_decoder = None  # CategorySpecificMLP -> velocity
+        self.position_embedding = None
 
     # ------------------------------------------------------------------
     # Config
@@ -138,8 +147,21 @@ class Gr00tN17Model(Model):
                     name="vlm",
                     input_names=["image_inputs", "text_inputs"],
                     outputs=[
+                        # The DiT needs more than the features: AlternateVLDiT
+                        # splits its cross-attention between the VLM's text and
+                        # image tokens, so it needs to know which positions are
+                        # images (image_mask) and which are padding
+                        # (backbone_attention_mask).
                         GraphEdge(
                             next_node=EMPTY_DESTINATION, name="vl_embeds", persist=True
+                        ),
+                        GraphEdge(
+                            next_node=EMPTY_DESTINATION, name="image_mask", persist=True
+                        ),
+                        GraphEdge(
+                            next_node=EMPTY_DESTINATION,
+                            name="backbone_attention_mask",
+                            persist=True,
                         ),
                     ],
                 ),
@@ -153,6 +175,14 @@ class Gr00tN17Model(Model):
                     outputs=[
                         GraphEdge(
                             next_node=EMPTY_DESTINATION, name="state_features", persist=True
+                        ),
+                        # Passed straight through so the DiT can reach it: its
+                        # action encoder/decoder are embodiment-conditioned too,
+                        # and a walk's inputs are not visible to the next walk.
+                        # See 06 - Gaps: mstar has no slot for a per-request
+                        # conditioning scalar, so it rides a tensor edge.
+                        GraphEdge(
+                            next_node=EMPTY_DESTINATION, name="embodiment_id", persist=True
                         ),
                     ],
                 ),
@@ -178,10 +208,16 @@ class Gr00tN17Model(Model):
             section=GraphNode(
                 name="dit",
                 input_names=[
+                    # evolving: looped back by name each iteration
                     "noisy_actions",
                     "timestep_index",
+                    # frozen conditioning: external inputs, entering once from
+                    # persist_signals and re-presented every iteration
                     "state_features",
                     "vl_embeds",
+                    "image_mask",
+                    "backbone_attention_mask",
+                    "embodiment_id",
                 ],
                 outputs=[
                     GraphEdge(next_node="dit", name="noisy_actions"),
@@ -308,8 +344,8 @@ class Gr00tN17Model(Model):
                 GraphEdge(next_node="dit", name="timestep_index"),
             ]
             # The prefill walk's conditioning, persisted at the conductor, seeds
-            # the loop's external inputs. Both are re-presented every iteration.
-            for name in ("state_features", "vl_embeds"):
+            # the loop's external inputs. All are re-presented every iteration.
+            for name in Gr00tDiTSubmodule.FROZEN_INPUTS:
                 edge = GraphEdge(next_node="dit", name=name)
                 edge.tensor_info = persist_signals.get(name, [])
                 inputs.append(edge)
@@ -350,6 +386,15 @@ class Gr00tN17Model(Model):
             return Gr00tStateEncoderSubmodule(
                 state_encoder=self.state_encoder, config=self.config
             )
+        if node_name == "dit":
+            self._init_dit(device)
+            return Gr00tDiTSubmodule(
+                dit=self.dit,
+                action_encoder=self.action_encoder,
+                action_decoder=self.action_decoder,
+                position_embedding=self.position_embedding,
+                config=self.config,
+            )
         return None
 
     def _init_state_encoder(self, device: str):
@@ -362,4 +407,38 @@ class Gr00tN17Model(Model):
             hidden_dim=self.config.dit_hidden_size,
             output_dim=self.config.input_embedding_dim,
         ).to(device)
+        # TODO(phase4): load real weights; this is random-init until then.
+
+    def _init_dit(self, device: str):
+        """Build the flow-matching action head, matching Gr00tN1d7ActionHead."""
+        if self.dit is not None:
+            return
+        cfg = self.config
+        self.dit = AlternateVLDiT(
+            num_attention_heads=cfg.dit_num_heads,
+            attention_head_dim=cfg.dit_head_dim,
+            output_dim=cfg.dit_hidden_size,
+            num_layers=cfg.dit_num_layers,
+            norm_type="ada_norm",
+            interleave_self_attention=cfg.dit_interleave_self_attention,
+            cross_attention_dim=cfg.backbone_embedding_dim,
+            attend_text_every_n_blocks=cfg.attend_text_every_n_blocks,
+            max_num_positional_embeddings=cfg.max_seq_len,
+        ).to(device)
+        self.action_encoder = MultiEmbodimentActionEncoder(
+            action_dim=cfg.max_action_dim,
+            hidden_size=cfg.input_embedding_dim,
+            num_embodiments=cfg.max_num_embodiments,
+        ).to(device)
+        self.action_decoder = CategorySpecificMLP(
+            num_categories=cfg.max_num_embodiments,
+            input_dim=cfg.dit_hidden_size,
+            hidden_dim=cfg.dit_hidden_size,
+            output_dim=cfg.max_action_dim,
+        ).to(device)
+        self.position_embedding = (
+            torch.nn.Embedding(cfg.max_seq_len, cfg.input_embedding_dim).to(device)
+            if cfg.add_pos_embed
+            else None
+        )
         # TODO(phase4): load real weights; this is random-init until then.
