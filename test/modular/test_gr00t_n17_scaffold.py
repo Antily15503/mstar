@@ -1,6 +1,11 @@
-"""Phase 2 scaffold checks for GR00T N1.7: the model loads via the registry,
-instantiates in dummy mode (no weights), and builds a valid walk graph.
-Forward compute is not covered here (Phase 3)."""
+"""GR00T N1.7 structural + component tests.
+
+Scaffold: the model loads via the registry, instantiates with no weights, and
+builds a valid walk graph (3 nodes, prefill Parallel -> denoise Loop).
+Components: the state_encoder is real and exercised end to end; vlm and dit are
+still stubbed (Phase 3), so their forward compute is not covered here."""
+
+import torch
 
 from mstar.graph.base import Loop, Parallel
 from mstar.model.registry import get_model_class
@@ -52,4 +57,63 @@ def test_denoise_loop_takes_persisted_conditioning():
 
 
 def test_dummy_mode_loads_no_submodule():
+    """dit/vlm are still stubbed (Phase 3); state_encoder is real."""
     assert _model().get_submodule("dit") is None
+
+
+# --- state_encoder (first real component) ---------------------------------
+
+
+def test_state_encoder_submodule_is_built():
+    m = _model()
+    sub = m.get_submodule("state_encoder")
+    assert sub is not None
+    assert m.get_submodule("state_encoder") is sub  # cached
+
+
+def test_state_encoder_shapes_match_gr00t():
+    """CategorySpecificMLP: [B, 1, state_dim*T] -> [B, 1, input_embedding_dim]."""
+    m = _model()
+    cfg = m.config
+    mlp = m.get_submodule("state_encoder").state_encoder
+    x = torch.randn(2, 1, cfg.max_state_dim * cfg.state_history_length)
+    out = mlp(x, torch.tensor([0, 3]))
+    assert out.shape == (2, 1, cfg.input_embedding_dim)
+
+
+def test_embodiment_id_selects_different_weights():
+    """The point of CategorySpecificMLP: different embodiment -> different
+    weight bank -> different output for identical input."""
+    m = _model()
+    cfg = m.config
+    mlp = m.get_submodule("state_encoder").state_encoder
+    x = torch.randn(1, 1, cfg.max_state_dim * cfg.state_history_length)
+    out_a = mlp(x, torch.tensor([0]))
+    out_b = mlp(x, torch.tensor([7]))
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_state_encoder_end_to_end_through_submodule():
+    """prepare_inputs -> preprocess -> forward, the way M* drives it."""
+    m = _model()
+    cfg = m.config
+    sub = m.get_submodule("state_encoder")
+    state = torch.randn(cfg.state_history_length, cfg.max_state_dim)
+    node_inputs = sub.prepare_inputs(
+        "prefill",
+        None,
+        {"state_inputs": [state], "embodiment_id": [torch.tensor(2)]},
+    )
+    kwargs = sub.preprocess("prefill", None, [node_inputs])
+    out = sub.forward("prefill", None, **kwargs)
+    assert list(out) == ["state_features"]
+    assert out["state_features"][0].shape == (1, cfg.input_embedding_dim)
+
+
+def test_state_encoder_defaults_embodiment_id_when_absent():
+    m = _model()
+    cfg = m.config
+    sub = m.get_submodule("state_encoder")
+    state = torch.randn(cfg.state_history_length, cfg.max_state_dim)
+    node_inputs = sub.prepare_inputs("prefill", None, {"state_inputs": [state]})
+    assert int(node_inputs.tensor_inputs["embodiment_id"]) == 0

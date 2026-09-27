@@ -38,7 +38,9 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.gr00t_n17.components.embodiment_mlp import CategorySpecificMLP
 from mstar.model.gr00t_n17.config import GR00TConfig, load_gr00t_config
+from mstar.model.gr00t_n17.submodules import Gr00tStateEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -143,7 +145,11 @@ class Gr00tN17Model(Model):
                 ),
                 GraphNode(
                     name="state_encoder",
-                    input_names=["state_inputs"],
+                    # embodiment_id picks which per-robot weight bank the
+                    # CategorySpecificMLP uses, so it is routed as its own
+                    # named input rather than packed into the state vector
+                    # (it is an integer index, not proprioception).
+                    input_names=["state_inputs", "embodiment_id"],
                     outputs=[
                         GraphEdge(
                             next_node=EMPTY_DESTINATION, name="state_features", persist=True
@@ -219,6 +225,11 @@ class Gr00tN17Model(Model):
         image = kwargs.get("image_inputs", kwargs.get("image"))
         if image is not None:
             out["image_inputs"] = image if isinstance(image, list) else [image]
+        embodiment_id = kwargs.get("embodiment_id")
+        if embodiment_id is not None:
+            out["embodiment_id"] = [
+                torch.as_tensor(embodiment_id, dtype=torch.long).reshape(())
+            ]
         state = kwargs.get("state_inputs", kwargs.get("robot_state"))
         if state is not None:
             if not isinstance(state, torch.Tensor):
@@ -258,6 +269,7 @@ class Gr00tN17Model(Model):
             "image_inputs": "vlm",
             "text_inputs": "vlm",
             "state_inputs": "state_encoder",
+            "embodiment_id": "state_encoder",
         }
         inputs = []
         for signal_name, node_name in routing.items():
@@ -321,7 +333,33 @@ class Gr00tN17Model(Model):
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
-        # TODO(phase3): build real submodules (image_encoder / state_encoder /
-        # vlm / dit) from submodules.py + components/. Returning None = dummy
-        # mode: M* loads the model and builds the plan without weights.
-        return self._submodule_cache.get(node_name)
+        if node_name in self._submodule_cache:
+            return self._submodule_cache[node_name]
+        submodule = self._create_submodule(node_name, device)
+        self._submodule_cache[node_name] = submodule
+        if submodule is not None:
+            logger.info("Loaded GR00T N1.7 submodule for %s", node_name)
+        return submodule
+
+    def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
+        # TODO(phase3): "vlm" (wrap HF Qwen3VLForConditionalGeneration) and
+        # "dit" (AlternateVLDiT). Returning None for those keeps them in dummy
+        # mode so the rest of the graph can be exercised meanwhile.
+        if node_name == "state_encoder":
+            self._init_state_encoder(device)
+            return Gr00tStateEncoderSubmodule(
+                state_encoder=self.state_encoder, config=self.config
+            )
+        return None
+
+    def _init_state_encoder(self, device: str):
+        """Build the proprioception encoder, matching Gr00tN1d7ActionHead."""
+        if self.state_encoder is not None:
+            return
+        self.state_encoder = CategorySpecificMLP(
+            num_categories=self.config.max_num_embodiments,
+            input_dim=self.config.max_state_dim * self.config.state_history_length,
+            hidden_dim=self.config.dit_hidden_size,
+            output_dim=self.config.input_embedding_dim,
+        ).to(device)
+        # TODO(phase4): load real weights; this is random-init until then.
