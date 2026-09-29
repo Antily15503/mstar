@@ -72,9 +72,33 @@ def test_prefill_persists_everything_the_loop_needs():
     assert set(Gr00tDiTSubmodule.FROZEN_INPUTS) <= produced
 
 
-def test_vlm_is_still_stubbed():
-    """vlm waits on HF access to the gated Cosmos-Reason2-2B repo."""
+def test_vlm_falls_back_to_dummy_mode_when_the_backbone_is_unavailable():
+    """nvidia/Cosmos-Reason2-2B is gated, so the node must degrade to dummy
+    mode rather than raising -- the rest of the graph stays exercisable."""
     assert _model().get_submodule("vlm") is None
+
+
+def test_vlm_takes_the_qwen3vl_processor_contract():
+    """The backbone consumes the processor's outputs, matching
+    Qwen3Backbone.forward's keys_to_use -- not vague image/text blobs."""
+    from mstar.model.gr00t_n17.submodules import Gr00tVLMSubmodule
+
+    m = _model()
+    vlm = next(
+        n for n in m.get_graph_walk_graphs()["prefill"].sections if n.name == "vlm"
+    )
+    assert set(vlm.input_names) == set(Gr00tVLMSubmodule.HF_INPUTS)
+    assert "input_ids" in vlm.input_names
+
+
+def test_no_engine_resources_by_design():
+    """Not a stub: nothing in GR00T needs engine-managed state. The vlm runs
+    once (no KV), the state encoder is an MLP, and the DiT's conditioning is a
+    persisted tensor with diffusers' own attention. No sampler either --
+    actions are continuous, there is no vocabulary."""
+    m = _model()
+    assert m.get_node_resources() == []
+    assert "correct answer" in (m.get_node_resources.__doc__ or "")
 
 
 # --- state_encoder (first real component) ---------------------------------

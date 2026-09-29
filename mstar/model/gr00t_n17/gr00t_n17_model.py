@@ -1,20 +1,28 @@
 """GR00T N1.7 Model subclass — declares the compute graph, walks, and the
 per-request walk state machine for M*.
 
-TODO(notes-pass): full module docstring.
+GR00T N1.7 is a vision-language-action policy: image(s) + a language
+instruction + the robot's proprioceptive state in, a continuous action
+trajectory out. Three nodes, faithful to ``Gr00tN1d7ActionHead``:
 
-Graph shape (faithful to Gr00tN1d7ActionHead): 3 nodes — ``vlm`` (Cosmos-
-Reason2-2B / Qwen3-VL, vision tower included), ``state_encoder``
-(CategorySpecificMLP, embodiment-indexed) and ``dit`` (AlternateVLDiT flow-
-matching head). The DiT **cross-attends** the VLM output
-(``encoder_hidden_states=vl_embeds``); it does not share a KV cache the way
-pi05's action expert does.
+    vlm            Cosmos-Reason2-2B (Qwen3-VL). The vision tower is INSIDE it,
+                   so there is no standalone image encoder (contrast pi05,
+                   which splits its SigLIP out). Also owns the VL bridge.
+    state_encoder  CategorySpecificMLP, embodiment-indexed.
+    dit            AlternateVLDiT flow-matching action head.
 
-Scaffold status (Phase 2): structure + walk state machine are real; forward
-compute is stubbed. ``get_submodule`` returns ``None`` (dummy mode), so M* can
-*load* GR00T with no weights. ``get_node_resources`` and the neural-net
-components are Phase 3 — the remaining blocker is the gated
-nvidia/Cosmos-Reason2-2B repo (backbone KV dims).
+    prefill = Parallel([vlm, state_encoder])    # conditioning, computed once
+    denoise = Loop(dit, max_iters=4) -> emit action
+
+The DiT **cross-attends** the VLM output (``encoder_hidden_states=vl_embeds``);
+it does not share a KV cache the way pi05's action expert does. Conditioning
+therefore crosses the walk boundary as *persist signals* rather than living in
+a resource -- GR00T consumes those tensors on every denoise step.
+
+Status: all three nodes are implemented; the DiT is parity-tested bit-exact
+against the reference. The ``vlm`` node stays in dummy mode until an authorized
+HF token is available -- nvidia/Cosmos-Reason2-2B is a GATED repo. Weight
+loading for the other nodes is Phase 4 (they are random-init today).
 """
 
 import json
@@ -38,13 +46,17 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.gr00t_n17.components.dit import AlternateVLDiT
+from mstar.model.gr00t_n17.components.dit import AlternateVLDiT, SelfAttentionTransformer
 from mstar.model.gr00t_n17.components.embodiment_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
 from mstar.model.gr00t_n17.config import GR00TConfig, load_gr00t_config
-from mstar.model.gr00t_n17.submodules import Gr00tDiTSubmodule, Gr00tStateEncoderSubmodule
+from mstar.model.gr00t_n17.submodules import (
+    Gr00tDiTSubmodule,
+    Gr00tStateEncoderSubmodule,
+    Gr00tVLMSubmodule,
+)
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -80,7 +92,13 @@ class Gr00tN17Model(Model):
         # INSIDE the Cosmos-Reason2-2B (Qwen3-VL) backbone, so there is no
         # standalone image encoder to split out (contrast pi05, which does
         # separate its SigLIP `vit_encoder` from the LLM).
+        # The vlm node owns the backbone plus the VL bridge (vlln +
+        # vl_self_attention), which GR00T keeps on the action head but runs
+        # once, before the denoise loop.
         self.vlm = None             # Cosmos-Reason2-2B backbone (vision + language)
+        self.vlln = None
+        self.vl_self_attention = None
+        self._image_token_id: int | None = None
         self.state_encoder = None   # CategorySpecificMLP, embodiment-indexed
         # The dit node owns four modules: the transformer plus the action
         # encoder/decoder that bracket it and the action position embedding.
@@ -113,17 +131,29 @@ class Gr00tN17Model(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        # TODO(phase3): declare the VLM's KV/Attn/Pos specs and the DiT's
-        # attention spec. Still blocked on the backbone's KV dims
-        # (num_layers/kv_heads/head_dim), which live in the GATED
-        # nvidia/Cosmos-Reason2-2B config.
-        # Fusion is resolved: the DiT cross-attends vl_embeds, so its context
-        # is a persisted tensor, not a shared KV prefix. Passing vl_embeds
-        # straight through as a loop input is the correct-and-simple v1; a
-        # CrossAttentionSpec (caching the projected K/V once instead of
-        # re-projecting on all 4 steps) is a later optimization — see
-        # [[06 - Gaps and Improvement Ideas]].
-        # Empty is valid for the dummy-load scaffold.
+        """GR00T declares no engine resources -- and that is the correct answer,
+        not a stub.
+
+        Resources exist for state the engine must manage across forward passes:
+        a paged KV cache, its attention plan, rotary positions, a sampler. None
+        of GR00T's three nodes need any:
+
+        * ``vlm`` -- called exactly ONCE per request, no token generation, so
+          nothing is cached between passes. (A resource-free node is normal:
+          pi05's ``vit_encoder`` appears in no spec either.)
+        * ``state_encoder`` -- a two-layer MLP.
+        * ``dit`` -- iterates, but its conditioning is a persisted tensor and
+          its attention is diffusers' own, not mstar's paged attention. Nothing
+          grows across the four Euler steps.
+
+        No ``SamplerSpec``: actions are continuous, there is no vocabulary.
+
+        The cost is that mstar's paged-attention and CUDA-graph fast paths do
+        not apply to the DiT loop. Revisiting that -- a ``CrossAttentionSpec``
+        to cache the projected cross-attention K/V once instead of
+        re-projecting it on every step -- is a Phase 5 performance question,
+        not a correctness one. See 06 - Gaps and Improvement Ideas.
+        """
         return []
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -145,7 +175,9 @@ class Gr00tN17Model(Model):
             [
                 GraphNode(
                     name="vlm",
-                    input_names=["image_inputs", "text_inputs"],
+                    # The Qwen3-VL processor's outputs, matching
+                    # Qwen3Backbone.forward's keys_to_use.
+                    input_names=list(Gr00tVLMSubmodule.HF_INPUTS),
                     outputs=[
                         # The DiT needs more than the features: AlternateVLDiT
                         # splits its cross-attention between the VLM's text and
@@ -251,16 +283,16 @@ class Gr00tN17Model(Model):
         output_modalities: list[str],
         **kwargs,
     ) -> NameToTensorList:
-        # TODO(phase3): real preprocessing — Cosmos-Reason2-2B tokenization for
-        # text, SigLip2 image transform, and raw float state + embodiment id for
-        # the MLP encoder. This scaffold produces structurally-valid tensors so
-        # the graph can be exercised without weights.
+        # TODO(phase4): run the real Qwen3-VL processor here to turn
+        # prompt + images into input_ids / attention_mask / pixel_values /
+        # image_grid_thw. That processor ships with the GATED
+        # nvidia/Cosmos-Reason2-2B repo, so until access lands the caller
+        # supplies them directly (which is also what a parity harness does).
         out: NameToTensorList = {}
-        if prompt is not None:
-            out["text_inputs"] = [torch.tensor(list(prompt.encode("utf-8")), dtype=torch.long)]
-        image = kwargs.get("image_inputs", kwargs.get("image"))
-        if image is not None:
-            out["image_inputs"] = image if isinstance(image, list) else [image]
+        for name in Gr00tVLMSubmodule.HF_INPUTS:
+            value = kwargs.get(name)
+            if value is not None:
+                out[name] = value if isinstance(value, list) else [value]
         embodiment_id = kwargs.get("embodiment_id")
         if embodiment_id is not None:
             out["embodiment_id"] = [
@@ -298,15 +330,12 @@ class Gr00tN17Model(Model):
             kwargs={},
         )
 
-        # Route each external input to the node that consumes it. Images and
-        # text both go to the VLM: the vision tower is inside the Qwen3-VL
-        # backbone, so there is no separate encoder node to route images to.
-        routing = {
-            "image_inputs": "vlm",
-            "text_inputs": "vlm",
-            "state_inputs": "state_encoder",
-            "embodiment_id": "state_encoder",
-        }
+        # Route each external input to the node that consumes it. All four
+        # processor tensors go to the VLM: the vision tower is inside the
+        # Qwen3-VL backbone, so there is no separate encoder node for images.
+        routing = {name: "vlm" for name in Gr00tVLMSubmodule.HF_INPUTS}
+        routing["state_inputs"] = "state_encoder"
+        routing["embodiment_id"] = "state_encoder"
         inputs = []
         for signal_name, node_name in routing.items():
             if signal_name in input_signals:
@@ -386,6 +415,16 @@ class Gr00tN17Model(Model):
             return Gr00tStateEncoderSubmodule(
                 state_encoder=self.state_encoder, config=self.config
             )
+        if node_name == "vlm":
+            if not self._init_vlm(device):
+                return None
+            return Gr00tVLMSubmodule(
+                backbone=self.vlm,
+                vlln=self.vlln,
+                vl_self_attention=self.vl_self_attention,
+                image_token_id=self._image_token_id,
+                config=self.config,
+            )
         if node_name == "dit":
             self._init_dit(device)
             return Gr00tDiTSubmodule(
@@ -408,6 +447,63 @@ class Gr00tN17Model(Model):
             output_dim=self.config.input_embedding_dim,
         ).to(device)
         # TODO(phase4): load real weights; this is random-init until then.
+
+    def _init_vlm(self, device: str) -> bool:
+        """Load the Qwen3-VL backbone and build the VL bridge.
+
+        Returns False (leaving the node in dummy mode) when the backbone cannot
+        be loaded -- nvidia/Cosmos-Reason2-2B is a GATED repo, so this is the
+        expected path until an authorized HF token is available. Everything
+        else in the model is exercisable meanwhile.
+        """
+        if self.vlm is not None:
+            return True
+        if self.skip_weight_loading:
+            return False
+        cfg = self.config
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+
+            backbone = Qwen3VLForConditionalGeneration.from_pretrained(
+                cfg.backbone_model_name, cache_dir=self.cache_dir
+            ).eval()
+        except Exception as exc:
+            logger.warning(
+                "Could not load the GR00T backbone %s (%s). The vlm node stays "
+                "in dummy mode; note the repo is gated and needs an authorized "
+                "HF token.",
+                cfg.backbone_model_name,
+                exc,
+            )
+            return False
+
+        # select_layer is applied by TRUNCATING the stack, not by indexing into
+        # it: GR00T pops layers above select_layer so the last hidden state IS
+        # the selected one, and the layers above are never computed.
+        while len(backbone.language_model.layers) > cfg.select_layer:
+            backbone.language_model.layers.pop(-1)
+
+        self.vlm = backbone.to(device)
+        self._image_token_id = backbone.config.image_token_id
+        # The VL bridge lives here rather than in the denoise loop -- see the
+        # Gr00tVLMSubmodule docstring.
+        self.vlln = (
+            torch.nn.LayerNorm(cfg.backbone_embedding_dim) if cfg.use_vlln else torch.nn.Identity()
+        ).to(device)
+        self.vl_self_attention = (
+            SelfAttentionTransformer(
+                num_attention_heads=cfg.bridge_num_heads,
+                attention_head_dim=cfg.bridge_head_dim,
+                num_layers=cfg.bridge_num_layers,
+                max_num_positional_embeddings=cfg.max_seq_len,
+            ).to(device)
+            if cfg.bridge_num_layers > 0
+            else torch.nn.Identity()
+        )
+        # TODO(phase4): load the bridge's real weights. Their checkpoint keys
+        # sit under the ACTION HEAD prefix (vlln.*, vl_self_attention.*) even
+        # though this node owns the modules.
+        return True
 
     def _init_dit(self, device: str):
         """Build the flow-matching action head, matching Gr00tN1d7ActionHead."""

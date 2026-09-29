@@ -8,13 +8,8 @@ nothing about M*; the submodules know nothing about the maths.
                                 Stateless, runs once during ``prefill``.
   Gr00tDiTSubmodule          -- one Euler step of the flow-matching action head.
                                 Runs once per ``denoise`` loop iteration.
-
-TODO(phase3): Gr00tVLMSubmodule, wrapping HF Qwen3VLForConditionalGeneration.
-It also owns the VL bridge (``vlln`` + ``vl_self_attention``): GR00T keeps
-those on the action head but calls them once, in ``process_backbone_output``,
-before the denoise loop -- so in mstar they belong to the prefill node, not the
-loop body. NOTE for weight loading: their checkpoint keys therefore sit under
-the action-head prefix while the vlm submodule owns the modules.
+  Gr00tVLMSubmodule          -- wrapped Qwen3-VL backbone + the VL bridge.
+                                Stateless one-shot, runs once during ``prefill``.
 """
 
 import logging
@@ -292,4 +287,110 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         return {
             "noisy_actions": [actions[i] for i in range(batch)],
             "timestep_index": [next_step.clone() for _ in range(batch)],
+        }
+
+
+class Gr00tVLMSubmodule(NodeSubmodule):
+    """Cosmos-Reason2-2B (Qwen3-VL) backbone + the VL bridge.
+
+    Wraps the HF model rather than hand-porting it: GR00T calls the backbone
+    exactly once per request (``backbone_outputs = self.backbone(...)``), so it
+    is a stateless one-shot encoder with no KV reuse -- the same situation as
+    whisper's encoder and pi05's SigLIP, both of which mstar wraps.
+
+    It also owns the **VL bridge** (``vlln`` + ``vl_self_attention``). GR00T
+    keeps those on the action head, but calls them once in
+    ``process_backbone_output`` before the denoise loop, so in mstar they belong
+    here -- running them in the loop body would repeat them once per Euler step.
+    NOTE for weight loading: their checkpoint keys therefore sit under the
+    action-head prefix while this submodule owns the modules.
+
+    Emits the three tensors the DiT needs::
+
+        vl_embeds               [B, S, backbone_embedding_dim]  (bridged)
+        image_mask              [B, S]  input_ids == image_token_id
+        backbone_attention_mask [B, S]  attention_mask == 1
+
+    Inputs are the Qwen3-VL processor's outputs, matching
+    ``Qwen3Backbone.forward``'s ``keys_to_use``.
+    """
+
+    HF_INPUTS = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+
+    def __init__(self, backbone, vlln, vl_self_attention, image_token_id: int, config: GR00TConfig):
+        super().__init__()
+        self.backbone = backbone
+        self.vlln = vlln
+        self.vl_self_attention = vl_self_attention
+        self.image_token_id = image_token_id
+        self.config = config
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs,
+    ) -> NodeInputs:
+        tensors = {}
+        for name in self.HF_INPUTS:
+            vals = inputs.get(name)
+            if vals:
+                tensors[name] = vals[0]
+        if "input_ids" not in tensors:
+            raise ValueError("vlm node requires input_ids from the Qwen3-VL processor")
+        return NodeInputs(tensor_inputs=tensors)
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
+        # Sequential path is bs=1. Batching would need equal token counts (or
+        # padding) across requests before this can stack; can_batch must gate it.
+        out: dict[str, torch.Tensor | Any] = {}
+        for name in self.HF_INPUTS:
+            present = [i.tensor_inputs[name] for i in inputs if name in i.tensor_inputs]
+            if present:
+                out[name] = torch.stack(present, dim=0) if len(present) > 1 else present[0].unsqueeze(0)
+        return out
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        **kwargs,  # coming from preprocess output
+    ) -> NameToTensorList:
+        vl_input = {"input_ids": input_ids, "attention_mask": attention_mask}
+        if pixel_values is not None:
+            vl_input["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            vl_input["image_grid_thw"] = image_grid_thw
+
+        outputs = self.backbone(**vl_input, output_hidden_states=True)
+        # The LLM stack was truncated to ``select_layer`` at construction, so
+        # the last hidden state IS the selected layer (this is how GR00T does
+        # it -- popping layers rather than indexing, which also saves compute).
+        features = outputs.hidden_states[-1]
+
+        # The bridge: LayerNorm then self-attention, applied ONCE here rather
+        # than per denoise step.
+        features = self.vl_self_attention(self.vlln(features))
+
+        image_mask = input_ids == self.image_token_id
+        if attention_mask is None:
+            backbone_attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            backbone_attention_mask = attention_mask == 1
+
+        batch = features.shape[0]
+        return {
+            "vl_embeds": [features[i] for i in range(batch)],
+            "image_mask": [image_mask[i] for i in range(batch)],
+            "backbone_attention_mask": [backbone_attention_mask[i] for i in range(batch)],
         }
