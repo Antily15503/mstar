@@ -496,6 +496,8 @@ class Gr00tN17Model(Model):
                 attention_head_dim=cfg.bridge_head_dim,
                 num_layers=cfg.bridge_num_layers,
                 max_num_positional_embeddings=cfg.max_seq_len,
+                positional_embeddings=cfg.bridge_positional_embeddings,  # null in the checkpoint
+                dropout=cfg.bridge_dropout,
             ).to(device)
             if cfg.bridge_num_layers > 0
             else torch.nn.Identity()
@@ -520,6 +522,13 @@ class Gr00tN17Model(Model):
             cross_attention_dim=cfg.backbone_embedding_dim,
             attend_text_every_n_blocks=cfg.attend_text_every_n_blocks,
             max_num_positional_embeddings=cfg.max_seq_len,
+            # MUST come from config: the reference's default is "sinusoidal",
+            # but the checkpoint sets it to null. Defaulting here would add a
+            # pos_embed.pe buffer per block that the checkpoint has no weights
+            # for, breaking a strict load.
+            positional_embeddings=cfg.dit_positional_embeddings,
+            dropout=cfg.dit_dropout,
+            final_dropout=cfg.dit_final_dropout,
         ).to(device)
         self.action_encoder = MultiEmbodimentActionEncoder(
             action_dim=cfg.max_action_dim,

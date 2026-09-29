@@ -2,8 +2,18 @@
 
 Scaffold: the model loads via the registry, instantiates with no weights, and
 builds a valid walk graph (3 nodes, prefill Parallel -> denoise Loop).
-Components: the state_encoder is real and exercised end to end; vlm and dit are
-still stubbed (Phase 3), so their forward compute is not covered here."""
+
+Components: state_encoder and dit are real and exercised end to end, including
+all four Euler steps of the denoise loop. The vlm node's forward is NOT covered
+-- nvidia/Cosmos-Reason2-2B is gated, so it degrades to dummy mode here; only
+its graph contract and that fallback are tested.
+
+Weight layout: the action head's tensor counts are pinned against the released
+checkpoint's index, so a structural drift that would break a strict
+load_state_dict fails here first.
+
+Bit-exact numerical parity for the DiT lives in
+test_gr00t_n17_dit_equivalence.py."""
 
 import pytest
 import torch
@@ -89,6 +99,54 @@ def test_vlm_takes_the_qwen3vl_processor_contract():
     )
     assert set(vlm.input_names) == set(Gr00tVLMSubmodule.HF_INPUTS)
     assert "input_ids" in vlm.input_names
+
+
+# --- weight-layout contract (Phase 4 prep) --------------------------------
+#
+# Tensor counts per module in nvidia/GR00T-N1.7-3B's model.safetensors.index.json
+# (1031 tensors: 537 action_head.* + 494 backbone.*). Verified against the live
+# index; hardcoded here so the check runs offline. If a structural change makes one of
+# these drift, a strict load_state_dict against the real checkpoint will fail.
+CHECKPOINT_TENSOR_COUNTS = {
+    "model": 456,               # AlternateVLDiT, 32 blocks x 14
+    "vl_self_attention": 64,    # bridge, 4 blocks x 16
+    "vlln": 2,
+    "state_encoder": 4,
+    "action_encoder": 6,
+    "action_decoder": 4,
+    "position_embedding": 1,
+}
+
+
+def test_dit_has_no_positional_embedding_buffers():
+    """The checkpoint sets diffusion_model_cfg.positional_embeddings = null,
+    but the reference's own default is "sinusoidal" -- which registers a
+    pos_embed.pe buffer per block that the checkpoint has no weights for.
+    Regression: config must carry the null through to construction."""
+    m = _model()
+    assert m.config.dit_positional_embeddings is None
+    assert m.config.bridge_positional_embeddings is None
+    dit = m.get_submodule("dit").dit
+    assert not [k for k in dit.state_dict() if "pos_embed" in k]
+
+
+def test_action_head_tensor_counts_match_the_checkpoint():
+    """Every action-head module must expose exactly the tensors the released
+    checkpoint carries -- this is what makes a strict load possible."""
+    m = _tiny_dit_model()          # widths shrunk, layer counts real
+    m.config.dit_num_layers = 32   # structural: drives the key count
+    sub = m.get_submodule("dit")
+    counts = {
+        "model": len(sub.dit.state_dict()),
+        "action_encoder": len(sub.action_encoder.state_dict()),
+        "action_decoder": len(sub.action_decoder.state_dict()),
+        "position_embedding": len(sub.position_embedding.state_dict()),
+        "state_encoder": len(m.get_submodule("state_encoder").state_encoder.state_dict()),
+    }
+    for name, got in counts.items():
+        assert got == CHECKPOINT_TENSOR_COUNTS[name], (
+            f"{name}: {got} tensors, checkpoint has {CHECKPOINT_TENSOR_COUNTS[name]}"
+        )
 
 
 def test_no_engine_resources_by_design():

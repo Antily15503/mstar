@@ -75,6 +75,12 @@ class GR00TConfig:
     dit_interleave_self_attention: bool = True
     use_alternate_vl_dit: bool = True    # AlternateVLDiT vs plain DiT
     attend_text_every_n_blocks: int = 2  # AlternateVLDiT only
+    # The released checkpoint sets this to null. It is NOT cosmetic: the
+    # reference's default is "sinusoidal", which registers a pos_embed.pe
+    # buffer per block and would add 32 tensors the checkpoint does not have.
+    dit_positional_embeddings: str | None = None
+    dit_dropout: float = 0.2
+    dit_final_dropout: bool = True
 
     # Width of the state/action tokens fed to the DiT as hidden_states
     # (= dit_num_heads * dit_head_dim = 1536). Not present in the checkpoint
@@ -87,6 +93,8 @@ class GR00TConfig:
     bridge_num_layers: int = 4
     bridge_num_heads: int = 32
     bridge_head_dim: int = 64
+    bridge_positional_embeddings: str | None = None   # null in the checkpoint; see above
+    bridge_dropout: float = 0.2
     use_vlln: bool = True                # LayerNorm(backbone_embedding_dim) on VL features
 
     # ----- Action / flow matching -----
@@ -133,9 +141,14 @@ _HF_NESTED_FIELDS: dict[tuple[str, str], str] = {
     ("diffusion_model_cfg", "attention_head_dim"): "dit_head_dim",
     ("diffusion_model_cfg", "output_dim"): "dit_hidden_size",
     ("diffusion_model_cfg", "interleave_self_attention"): "dit_interleave_self_attention",
+    ("diffusion_model_cfg", "positional_embeddings"): "dit_positional_embeddings",
+    ("diffusion_model_cfg", "dropout"): "dit_dropout",
+    ("diffusion_model_cfg", "final_dropout"): "dit_final_dropout",
     ("vl_self_attention_cfg", "num_layers"): "bridge_num_layers",
     ("vl_self_attention_cfg", "num_attention_heads"): "bridge_num_heads",
     ("vl_self_attention_cfg", "attention_head_dim"): "bridge_head_dim",
+    ("vl_self_attention_cfg", "positional_embeddings"): "bridge_positional_embeddings",
+    ("vl_self_attention_cfg", "dropout"): "bridge_dropout",
 }
 
 _GR00T_FIELDS: set[str] = {f.name for f in GR00TConfig.__dataclass_fields__.values()}
