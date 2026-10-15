@@ -5,7 +5,7 @@ Replays the observations ``benchmark/isaac_gr00t_n17.py --dump-dir`` recorded,
 so mstar and the reference see *the same* DROID inputs: identical frames (same
 order: for each history step, each camera), identical raw state, identical
 instruction. Sends them to a running ``mstar-serve`` as ``POST /generate``,
-sequentially (concurrency=1, matching the reference loop), and writes a
+with --concurrency closed-loop clients (1 matches the reference loop), and writes a
 ``results.json`` that ``benchmark/compare_robotics.py`` can put next to the
 reference's.
 
@@ -27,6 +27,7 @@ import io
 import json
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +84,10 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=20004)
     ap.add_argument("--num-warmup", type=int, default=3)
     ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--concurrency", type=int, default=1, help="closed-loop clients in flight")
+    ap.add_argument("--num-requests", type=int, default=None, help="default: one per dump")
+    ap.add_argument("--baseline-dir", default=None,
+                    help="a --concurrency 1 output dir; report |diff| vs its actions (same seeds)")
     args = ap.parse_args()
 
     url = f"http://{args.host}:{args.port}/generate"
@@ -96,30 +101,58 @@ def main() -> None:
     for i in range(args.num_warmup):
         _post(url, *reqs[i % len(reqs)], request_id=f"warmup-{i}")
 
-    per_request = []
-    for rid, (files, text, kw) in enumerate(reqs):
+    # Request i replays dump i % N with seed i % N, so every repeat of a dump
+    # should return the same actions at any concurrency: a batching bug (e.g.
+    # requests on different denoise steps sharing one step) shows up as a diff
+    # vs --baseline-dir, far above the ~1e-3 batched-kernel noise.
+    n = args.num_requests or len(reqs)
+
+    def one(i: int) -> dict:
+        rid = i % len(reqs)
+        files, text, kw = reqs[rid]
         t0 = time.perf_counter()
-        raw = _post(url, files, text, kw, request_id=f"gr00t-{rid}")
+        raw = _post(url, files, text, {**kw, "seed": rid}, request_id=f"gr00t-{i}-{time.time_ns()}")
         jct = (time.perf_counter() - t0) * 1e3
-        actions = np.frombuffer(raw, dtype=np.float32).reshape(-1, 132)
-        np.save(out / f"req_{rid:02d}_actions.npy", actions)
-        per_request.append({
-            "request_id": rid, "jct_ms": jct, "n_actions": int(actions.shape[0]),
+        # Robot units, [40, sum of group dims] in action modality_keys order (17 for DROID).
+        # seed=rid draws exactly the noise the reference dump recorded (its --seed 0
+        # does torch.manual_seed(rid); a CUDA generator seeded rid gives identical
+        # values), so this is served-path port error in robot units (floor 0.0022).
+        actions = np.frombuffer(raw, dtype=np.float32).reshape(40, -1)
+        ref = np.concatenate([dumps[rid]["decoded_action"][k][0] for k in dumps[rid]["decoded_action"]], -1)
+        r = {
+            "request_id": i, "dump": rid, "jct_ms": jct, "n_actions": int(actions.shape[0]),
             "action_dim": int(actions.shape[1]), "finite": bool(np.isfinite(actions).all()),
-        })
-        print(f"req {rid:02d}: jct {jct:7.1f} ms")
+            "mean_abs_err_vs_ref": float(np.abs(actions - ref).mean()),
+        }
+        if args.baseline_dir:
+            base = np.load(Path(args.baseline_dir) / f"req_{rid:02d}_actions.npy")
+            r["max_abs_diff_vs_baseline"] = float(np.abs(actions - base).max())
+        if i < len(reqs):
+            np.save(out / f"req_{rid:02d}_actions.npy", actions)
+        return r
+
+    t_start = time.perf_counter()
+    with ThreadPoolExecutor(args.concurrency) as pool:
+        per_request = list(pool.map(one, range(n)))
+    wall_s = time.perf_counter() - t_start
+    for r in per_request[:20]:
+        print(f"req {r['request_id']:3d}: jct {r['jct_ms']:7.1f} ms  |err vs ref| {r['mean_abs_err_vs_ref']:.4f}")
 
     jcts = [r["jct_ms"] for r in per_request]
-    wall_s = sum(jcts) / 1e3
     pct = lambda q: float(np.percentile(jcts, q))  # noqa: E731
     results = {
         "system": "mstar", "model": "gr00t_n17", "num_requests": len(per_request),
-        "num_warmup": args.num_warmup, "completed": len(per_request), "failed": 0,
+        "num_warmup": args.num_warmup, "concurrency": args.concurrency,
+        "completed": len(per_request), "failed": 0,
         "jct_mean_ms": statistics.fmean(jcts), "jct_median_ms": statistics.median(jcts),
         "jct_std_ms": statistics.pstdev(jcts),
         "jct_p90_ms": pct(90), "jct_p95_ms": pct(95), "jct_p99_ms": pct(99),
         "request_throughput": len(jcts) / wall_s,
         "actions_per_sec": sum(r["n_actions"] for r in per_request) / wall_s,
+        "action_hz_per_client": 1e3 / statistics.median(jcts),
+        "mean_abs_err_vs_ref": statistics.fmean(r["mean_abs_err_vs_ref"] for r in per_request),
+        "max_abs_diff_vs_baseline": max((r.get("max_abs_diff_vs_baseline", float("nan")) for r in per_request),
+                                        default=float("nan")),
         "per_request": per_request,
     }
     (out / "results.json").write_text(json.dumps(results, indent=2))

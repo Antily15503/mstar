@@ -19,10 +19,10 @@ it does not share a KV cache the way pi05's action expert does. Conditioning
 therefore crosses the walk boundary as *persist signals* rather than living in
 a resource -- GR00T consumes those tensors on every denoise step.
 
-Status: all three nodes are implemented; the DiT is parity-tested bit-exact
-against the reference. The ``vlm`` node stays in dummy mode until an authorized
-HF token is available -- nvidia/Cosmos-Reason2-2B is a GATED repo. Weight
-loading for the other nodes is Phase 4 (they are random-init today).
+Output: actions in robot units, decoded exactly as Isaac-GR00T's
+``decode_action`` does (un-normalize, then relative -> absolute against the
+request's raw state): float32 ``[action_horizon, sum of action-group dims]``,
+groups concatenated in the embodiment's ``modality_keys`` order.
 """
 
 import json
@@ -375,16 +375,20 @@ class Gr00tN17Model(Model):
                 with open(hf_hub_download(self.model_path_hf, name, cache_dir=self.cache_dir)) as f:
                     return json.load(f)
 
+            processor_kwargs = meta("processor_config.json")["processor_kwargs"]
             self._io_cache = {
                 "processor": AutoProcessor.from_pretrained(
                     self.config.backbone_model_name, cache_dir=self.cache_dir
                 ),
                 "embodiment_ids": meta("embodiment_id.json"),
                 "statistics": meta("statistics.json"),
-                "modality_configs": meta("processor_config.json")["processor_kwargs"][
-                    "modality_configs"
-                ],
+                "modality_configs": processor_kwargs["modality_configs"],
+                "use_relative_action": processor_kwargs["use_relative_action"],
+                # Bound names for min-max normalization of state and absolute actions.
+                "bounds": ("q01", "q99") if processor_kwargs["use_percentiles"] else ("min", "max"),
             }
+            if processor_kwargs["use_mean_std"]:
+                raise NotImplementedError("GR00T checkpoint uses mean-std normalization; only min-max is ported")
         return self._io_cache
 
     def _process_observation(self, prompt: str, images: list[torch.Tensor], kwargs: dict) -> NameToTensorList:
@@ -394,8 +398,8 @@ class Gr00tN17Model(Model):
 
         assets = self._io_assets()
         tag = str(kwargs.get("embodiment_tag", "")).lower()
-        if tag not in assets["embodiment_ids"]:
-            raise ValueError(f"Unknown GR00T embodiment_tag {tag!r}")
+        if tag not in assets["embodiment_ids"] or tag not in assets["modality_configs"]:
+            raise ValueError(f"GR00T embodiment_tag {tag!r} has no processor config in this checkpoint")
 
         # Images: Isaac-GR00T's eval transform, reproduced exactly --
         # SmallestMaxSize(256, INTER_AREA) -> FractionalCenterCrop(0.95) ->
@@ -434,13 +438,16 @@ class Gr00tN17Model(Model):
         chat = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
         vl = processor(text=[chat], images=frames, return_tensors="pt", padding=True)
 
-        # State: percentile min-max to [-1, 1] per modality key (use_percentiles,
+        # State: min-max to [-1, 1] per modality key (percentile bounds,
         # clip_outliers), concatenated in modality order, zero-padded.
         stats = assets["statistics"][tag]["state"]
+        b_lo, b_hi = assets["bounds"]
         parts = []
         for key in assets["modality_configs"][tag]["state"]["modality_keys"]:
             x = np.asarray(kwargs["state"][key], dtype=np.float64).reshape(-1)
-            lo, hi = np.asarray(stats[key]["q01"]), np.asarray(stats[key]["q99"])
+            lo, hi = np.asarray(stats[key][b_lo]), np.asarray(stats[key][b_hi])
+            if x.size != lo.size:
+                raise ValueError(f"state[{key!r}] has {x.size} values, expected {lo.size} (one timestep)")
             norm = np.zeros_like(x)
             live = ~np.isclose(hi, lo)
             norm[live] = 2 * (x[live] - lo[live]) / (hi[live] - lo[live]) - 1
@@ -462,9 +469,60 @@ class Gr00tN17Model(Model):
         }
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        if modality == "action":
-            return output.detach().to(torch.float32).cpu().numpy().tobytes()
-        raise ValueError(f"Unsupported modality for GR00T N1.7: {modality!r}")
+        if modality != "action":
+            raise ValueError(f"Unsupported modality for GR00T N1.7: {modality!r}")
+        normalized = output.detach().to(torch.float32).cpu().numpy()
+        kwargs = request_kwargs or {}
+        if kwargs.get("state") is None:
+            # Pre-processed requests (parity harness) carry no raw state to
+            # decode against; they get the model's normalized [T, 132] output.
+            return normalized.tobytes()
+        tag = str(kwargs.get("embodiment_tag", "")).lower()
+        if tag not in self._io_assets()["modality_configs"]:
+            raise ValueError(f"cannot decode actions for GR00T embodiment_tag {tag!r}")
+        return self._decode_actions(normalized.reshape(-1, normalized.shape[-1]), tag, kwargs["state"]).tobytes()
+
+    def _decode_actions(self, normalized, tag: str, raw_state: dict):
+        """Isaac-GR00T ``StateActionProcessor.unapply_action``, in numpy.
+
+        Per action group: clip to [-1, 1], min-max un-normalize, and for
+        RELATIVE groups add (joints) or compose (EEF pose) the request's raw
+        state. Relative groups use the raw min/max of ``relative_action`` stats
+        (per step, ``[T, D]``); absolute ones use the percentile bounds of
+        ``action`` stats -- the reference overrides the percentile bounds for
+        relative keys, so mixing these up shifts every relative action. Group
+        widths come from ``action`` stats, as in the reference.
+        """
+        import numpy as np
+
+        assets = self._io_assets()
+        cfg = assets["modality_configs"][tag]["action"]
+        stats = assets["statistics"][tag]
+        horizon = len(cfg["delta_indices"])
+        groups, start = [], 0
+        for key, ac in zip(cfg["modality_keys"], cfg["action_configs"], strict=True):
+            relative = ac["rep"] == "RELATIVE" and assets["use_relative_action"]
+            s = stats["relative_action"][key] if relative else stats["action"][key]
+            b_lo, b_hi = ("min", "max") if relative else assets["bounds"]
+            lo, hi = np.asarray(s[b_lo]), np.asarray(s[b_hi])
+            dim = len(stats["action"][key]["min"])
+            if lo.shape[-1] != dim:
+                # e.g. xdof's empty wrist-EEF action stats; the reference crashes here too.
+                raise ValueError(f"{tag!r}: inconsistent action stats for {key!r}")
+            x = (np.clip(normalized[:horizon, start : start + dim], -1.0, 1.0) + 1.0) / 2.0 * (hi - lo) + lo
+            start += dim
+            if relative:
+                ref = np.asarray(raw_state[ac["state_key"] or key], dtype=np.float64).reshape(-1)
+                if ref.size != dim:
+                    raise ValueError(f"state[{ac['state_key'] or key!r}] has {ref.size} values, expected {dim}")
+                if ac["type"] == "NON_EEF":
+                    x = ref + x
+                elif ac["type"] == "EEF" and ac["format"] == "XYZ_ROT6D":
+                    x = _compose_xyz_rot6d(ref, x)
+                else:
+                    raise ValueError(f"Unsupported relative action {ac['type']}/{ac['format']} for {key!r}")
+            groups.append(x)
+        return np.concatenate(groups, axis=-1).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration (the walk state machine)
@@ -732,3 +790,24 @@ class Gr00tN17Model(Model):
                 self._load_checkpoint_prefix(
                     self.position_embedding, "action_head.position_embedding."
                 )
+
+
+def _rot6d_to_matrix(rot6d):
+    """``[..., 6]`` (first two matrix rows) -> ``[..., 3, 3]`` via Gram-Schmidt."""
+    import numpy as np
+
+    r1, r2 = rot6d[..., :3], rot6d[..., 3:]
+    r1 = r1 / np.linalg.norm(r1, axis=-1, keepdims=True)
+    r2 = r2 - (r1 * r2).sum(-1, keepdims=True) * r1
+    r2 = r2 / np.linalg.norm(r2, axis=-1, keepdims=True)
+    return np.stack([r1, r2, np.cross(r1, r2)], axis=-2)
+
+
+def _compose_xyz_rot6d(reference, relative):
+    """Absolute pose = reference @ relative, poses as ``[xyz, rot6d]`` rows."""
+    import numpy as np
+
+    r_ref = _rot6d_to_matrix(reference[3:])
+    rot = r_ref @ _rot6d_to_matrix(relative[:, 3:])
+    xyz = reference[:3] + relative[:, :3] @ r_ref.T
+    return np.concatenate([xyz, rot[:, :2, :].reshape(-1, 6)], axis=-1)

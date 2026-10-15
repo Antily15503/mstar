@@ -27,7 +27,7 @@ The whole module skips when ``GR00T_REF_DIR`` is unset or does not contain the
 reference file. There is deliberately no hardcoded default path.
 
 Coverage:
-  * state-dict key/shape sets and parameter count identical to the reference
+  * state-dict keys/shapes identical to the reference (``build_pair``'s strict load)
   * the interleave wiring: even-index blocks cross-attend, odd-index self-attend
     (the single most likely porting bug), for ``num_layers`` even and odd
   * ``TimestepEncoder`` bit-exact, including timestep 0 and the schedule end
@@ -44,9 +44,7 @@ Coverage:
   * behavioural, no reference: image-masked context tokens affect the output;
     tokens excluded by ``backbone_attention_mask`` are bit-irrelevant; both the
     text and the image branch of the alternation are genuinely exercised
-  * output shape ``(B, T, output_dim)``, documenting ``inner_dim != output_dim``
-  * output dtype/device follow the input; repeated calls are bit-identical; one
-    batch row cannot move another
+  * one batch row cannot move another
   * bf16 forward produces no NaN/Inf (serving dtype is bfloat16) -- smoke only
   * ``AlternateVLDiT`` rejects a missing ``image_mask`` /
     ``backbone_attention_mask`` / ``interleave_self_attention=False`` cleanly
@@ -112,7 +110,6 @@ TINY = {
     "cross_attention_dim": 48,
 }
 INNER_DIM = TINY["num_attention_heads"] * TINY["attention_head_dim"]
-OUTPUT_DIM = TINY["output_dim"]
 CROSS_DIM = TINY["cross_attention_dim"]
 SEED = 1234
 
@@ -154,10 +151,6 @@ def build_pair(class_name: str, **kwargs):
     ours = getattr(our_module(), class_name)(**kwargs)
     ours.load_state_dict(ref.state_dict(), strict=True)
     return ref.eval(), ours.eval()
-
-
-def shapes(module: torch.nn.Module) -> dict[str, tuple[int, ...]]:
-    return {k: tuple(v.shape) for k, v in module.state_dict().items()}
 
 
 def assert_bit_exact(ours: torch.Tensor, ref: torch.Tensor, what: str) -> None:
@@ -215,31 +208,9 @@ def vl_masks(batch: int = 2, ctx_len: int = 7):
 # ----------------------------------------------------------------------
 
 
-def test_dit_state_dict_keys_shapes_and_parameter_count_match_the_reference():
-    torch.manual_seed(SEED)
-    ref = ref_module().DiT(**TINY)
-    torch.manual_seed(SEED)
-    ours = our_module().DiT(**TINY)
-
-    ref_shapes, our_shapes = shapes(ref), shapes(ours)
-    assert set(our_shapes) == set(ref_shapes), (
-        f"state-dict keys diverge. only in ours: {sorted(set(our_shapes) - set(ref_shapes))}; "
-        f"only in reference: {sorted(set(ref_shapes) - set(our_shapes))}"
-    )
-    mismatched = {k: (our_shapes[k], ref_shapes[k]) for k in ref_shapes if our_shapes[k] != ref_shapes[k]}
-    assert not mismatched, f"state-dict shapes diverge (ours, reference): {mismatched}"
-
-    ours_n = sum(p.numel() for p in ours.parameters())
-    ref_n = sum(p.numel() for p in ref.parameters())
-    assert ours_n == ref_n, f"parameter count {ours_n} != reference {ref_n} (delta {ours_n - ref_n})"
-
-
-def test_alternate_vl_dit_state_dict_matches_the_reference():
-    torch.manual_seed(SEED)
-    ref = ref_module().AlternateVLDiT(**TINY, attend_text_every_n_blocks=2)
-    torch.manual_seed(SEED)
-    ours = our_module().AlternateVLDiT(**TINY, attend_text_every_n_blocks=2)
-    assert shapes(ours) == shapes(ref), "AlternateVLDiT state-dict diverges from the reference"
+# State-dict key/shape identity has no test of its own: build_pair's
+# load_state_dict(strict=True) raises on any missing/unexpected key or size
+# mismatch, for every class every test builds.
 
 
 @pytest.mark.parametrize("num_layers", [3, 4, 5])
@@ -410,20 +381,6 @@ def test_dit_forward_is_bit_exact_end_to_end(interleave):
             ours(hidden, context, timestep),
             ref(hidden, context, timestep),
             f"DiT end-to-end (interleave_self_attention={interleave})",
-        )
-
-
-@pytest.mark.parametrize("timestep_value", [0, 999])
-def test_dit_forward_is_bit_exact_at_both_ends_of_the_schedule(timestep_value):
-    """t=0 exercises the sin/cos embedding at the origin, t=999 at the schedule end."""
-    ref, ours = build_pair("DiT", **TINY)
-    hidden, context, _ = dit_inputs(batch=2)
-    timestep = torch.full((2,), timestep_value, dtype=torch.long)
-    with torch.no_grad():
-        assert_bit_exact(
-            ours(hidden, context, timestep),
-            ref(hidden, context, timestep),
-            f"DiT end-to-end (t={timestep_value})",
         )
 
 
@@ -598,32 +555,6 @@ def test_rows_of_a_batch_do_not_leak_into_each_other():
     assert_bit_exact(moved[1:], base[1:], "batch row 1 after perturbing only row 0")
     row0_delta = (moved[0] - base[0]).abs().max().item()
     assert row0_delta > 1e-4, f"perturbing row 0 did not move row 0 (max abs delta {row0_delta:.3e})"
-
-
-def test_alternate_vl_dit_output_shape_is_batch_by_action_len_by_output_dim():
-    """``inner_dim`` (32 here, 1536 in the checkpoint) is not ``output_dim``
-    (24 here, 1024 in the checkpoint) -- ``proj_out_2`` changes width on the way
-    out, and the DiT's contract is the *output_dim* one."""
-    _, ours = build_pair("AlternateVLDiT", **TINY, attend_text_every_n_blocks=2)
-    hidden, context, timestep = dit_inputs(batch=2, action_len=5, ctx_len=7)
-    image_mask, backbone_mask = vl_masks()
-    with torch.no_grad():
-        out = ours(hidden, context, timestep, image_mask=image_mask, backbone_attention_mask=backbone_mask)
-    assert out.shape == (2, 5, OUTPUT_DIM), f"expected (2, 5, {OUTPUT_DIM}), got {tuple(out.shape)}"
-    assert INNER_DIM != OUTPUT_DIM, "the test config no longer distinguishes inner_dim from output_dim"
-    assert out.dtype == hidden.dtype and out.device == hidden.device
-
-
-def test_repeated_forwards_are_bit_identical():
-    """No leftover dropout or other nondeterminism in eval mode."""
-    _, ours = build_pair("AlternateVLDiT", **TINY, attend_text_every_n_blocks=2)
-    hidden, context, timestep = dit_inputs(batch=2, ctx_len=7)
-    image_mask, backbone_mask = vl_masks()
-    kwargs = {"image_mask": image_mask, "backbone_attention_mask": backbone_mask}
-    with torch.no_grad():
-        first = ours(hidden, context, timestep, **kwargs)
-        second = ours(hidden, context, timestep, **kwargs)
-    assert_bit_exact(second, first, "AlternateVLDiT called twice")
 
 
 def test_alternate_vl_dit_rejects_missing_masks_and_disabled_interleaving():

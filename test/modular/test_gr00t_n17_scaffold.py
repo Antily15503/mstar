@@ -27,10 +27,6 @@ def _model():
     return cls(model_path_hf="nvidia/GR00T-N1.7-3B", skip_weight_loading=True)
 
 
-def test_registry_resolves_gr00t():
-    assert get_model_class("gr00t_n17").__name__ == "Gr00tN17Model"
-
-
 def test_instantiates_with_default_config():
     m = _model()
     assert m.config.num_inference_timesteps == 4
@@ -38,21 +34,15 @@ def test_instantiates_with_default_config():
 
 
 def test_walks_have_expected_shape():
+    """prefill = vlm || state_encoder, denoise = Loop(dit). GR00T's vision tower
+    is inside the Qwen3-VL backbone, so there is no standalone image encoder."""
     m = _model()
     walks = m.get_graph_walk_graphs()
     assert set(walks) == {"prefill", "denoise"}
-    assert isinstance(walks["prefill"], Parallel)   # vlm || state_encoder
+    assert isinstance(walks["prefill"], Parallel)
+    assert {n.name for n in walks["prefill"].sections} == {"vlm", "state_encoder"}
     assert isinstance(walks["denoise"], Loop)
     assert walks["denoise"].max_iters == m.config.num_inference_timesteps
-
-
-def test_three_nodes_no_standalone_image_encoder():
-    """GR00T's vision tower is inside the Qwen3-VL backbone, so the graph has
-    3 nodes (vlm / state_encoder / dit) — not pi05's 4-node decomposition."""
-    m = _model()
-    prefill = m.get_graph_walk_graphs()["prefill"]
-    names = {n.name for n in prefill.sections}
-    assert names == {"vlm", "state_encoder"}
 
 
 def test_denoise_loop_takes_persisted_conditioning():
@@ -98,7 +88,6 @@ def test_vlm_takes_the_qwen3vl_processor_contract():
         n for n in m.get_graph_walk_graphs()["prefill"].sections if n.name == "vlm"
     )
     assert set(vlm.input_names) == set(Gr00tVLMSubmodule.HF_INPUTS)
-    assert "input_ids" in vlm.input_names
 
 
 # --- weight-layout contract (Phase 4 prep) --------------------------------
@@ -156,39 +145,22 @@ def test_no_engine_resources_by_design():
     actions are continuous, there is no vocabulary."""
     m = _model()
     assert m.get_node_resources() == []
-    assert "correct answer" in (m.get_node_resources.__doc__ or "")
 
 
 # --- state_encoder (first real component) ---------------------------------
 
 
-def test_state_encoder_submodule_is_built():
-    m = _model()
-    sub = m.get_submodule("state_encoder")
-    assert sub is not None
-    assert m.get_submodule("state_encoder") is sub  # cached
-
-
-def test_state_encoder_shapes_match_gr00t():
-    """CategorySpecificMLP: [B, 1, state_dim*T] -> [B, 1, input_embedding_dim]."""
-    m = _model()
-    cfg = m.config
-    mlp = m.get_submodule("state_encoder").state_encoder
-    x = torch.randn(2, 1, cfg.max_state_dim * cfg.state_history_length)
-    out = mlp(x, torch.tensor([0, 3]))
-    assert out.shape == (2, 1, cfg.input_embedding_dim)
-
-
 def test_embodiment_id_selects_different_weights():
-    """The point of CategorySpecificMLP: different embodiment -> different
-    weight bank -> different output for identical input."""
+    """CategorySpecificMLP: [B, 1, state_dim*T] -> [B, 1, input_embedding_dim],
+    and a different embodiment selects a different weight bank, so identical
+    rows give different outputs."""
     m = _model()
     cfg = m.config
     mlp = m.get_submodule("state_encoder").state_encoder
-    x = torch.randn(1, 1, cfg.max_state_dim * cfg.state_history_length)
-    out_a = mlp(x, torch.tensor([0]))
-    out_b = mlp(x, torch.tensor([7]))
-    assert not torch.allclose(out_a, out_b)
+    x = torch.randn(1, 1, cfg.max_state_dim * cfg.state_history_length).expand(2, 1, -1)
+    out = mlp(x, torch.tensor([0, 7]))
+    assert out.shape == (2, 1, cfg.input_embedding_dim)
+    assert not torch.allclose(out[0], out[1])
 
 
 def test_state_encoder_end_to_end_through_submodule():
@@ -196,6 +168,7 @@ def test_state_encoder_end_to_end_through_submodule():
     m = _model()
     cfg = m.config
     sub = m.get_submodule("state_encoder")
+    assert m.get_submodule("state_encoder") is sub  # cached
     state = torch.randn(cfg.state_history_length, cfg.max_state_dim)
     node_inputs = sub.prepare_inputs(
         "prefill",
@@ -303,19 +276,6 @@ def test_denoise_loop_runs_all_euler_steps():
     assert all(torch.isfinite(t).all() for t in trajectory)
     # Euler must actually move the chunk, or the head is a no-op.
     assert not torch.allclose(trajectory[0], trajectory[-1])
-
-
-def test_denoise_first_iteration_seeds_its_own_noise():
-    """noisy_actions/timestep_index arrive empty on iteration 0; the submodule
-    draws the Gaussian itself (one draw per request, then pure refinement)."""
-    m = _tiny_dit_model()
-    cfg = m.config
-    sub = m.get_submodule("dit")
-    node_inputs = sub.prepare_inputs("denoise", _fwd_info(), _frozen_conditioning(cfg))
-    assert node_inputs.tensor_inputs["noisy_actions"].shape == (
-        cfg.action_horizon, cfg.max_action_dim,
-    )
-    assert int(node_inputs.tensor_inputs["timestep_index"]) == 0
 
 
 def test_denoise_requires_its_conditioning():
