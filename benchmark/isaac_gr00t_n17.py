@@ -118,6 +118,10 @@ def main() -> None:
                     help="read pre-decoded observations (a torch-saved list of parsed obs) instead of decoding "
                          "the dataset's videos -- for machines whose FFmpeg lacks an AV1 decoder, and to give "
                          "every machine byte-identical inputs")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the action head's DiT forward with mode='max-autotune' and turn on "
+                         "cudnn.benchmark -- exactly what Isaac-GR00T's scripts/deployment/benchmark_inference.py "
+                         "does for its compiled mode. Use a warmup that covers every sequence length.")
     ap.add_argument("--no-flash-attn", action="store_true",
                     help="hide flash_attn so the backbone falls back to SDPA (mstar's kernel). "
                          "Diffing this run against the default one gives the reference's own "
@@ -141,6 +145,10 @@ def main() -> None:
     policy = Gr00tPolicy(embodiment_tag=EMBODIMENT_TAG, model_path=args.model_path, device=device)
     model = policy.model
     head = model.action_head
+    if args.compile:
+        head.model.forward = torch.compile(head.model.forward, mode="max-autotune")
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
 
     # Capture the action head's intermediates with forward hooks (no edits to
     # NVIDIA's code). hidden_states[-1] of the truncated LLM is the backbone's
@@ -284,6 +292,7 @@ def main() -> None:
         "per_request": per_request,
         "torch": torch.__version__,
         "attn_impl": "flash_attention_2" if _has_flash_attn() else "sdpa",
+        "compiled": "dit forward, max-autotune" if args.compile else "eager",
     }
     (out / "results.json").write_text(json.dumps(results, indent=2))
     print(json.dumps({k: v for k, v in results.items() if k != "per_request"}, indent=2))
