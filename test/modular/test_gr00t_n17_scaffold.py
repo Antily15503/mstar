@@ -5,8 +5,8 @@ builds a valid walk graph (3 nodes, prefill Parallel -> denoise Loop).
 
 Components: state_encoder and dit are real and exercised end to end, including
 all four Euler steps of the denoise loop. The vlm node's forward is NOT covered
--- nvidia/Cosmos-Reason2-2B is gated, so it degrades to dummy mode here; only
-its graph contract and that fallback are tested.
+here: under skip_weight_loading it is a dummy (None) node, so only its graph
+contract is tested (real weights: test/integration/test_gr00t_n17_real_weights.py).
 
 Weight layout: the action head's tensor counts are pinned against the released
 checkpoint's index, so a structural drift that would break a strict
@@ -72,10 +72,33 @@ def test_prefill_persists_everything_the_loop_needs():
     assert set(Gr00tDiTSubmodule.FROZEN_INPUTS) <= produced
 
 
-def test_vlm_falls_back_to_dummy_mode_when_the_backbone_is_unavailable():
-    """nvidia/Cosmos-Reason2-2B is gated, so the node must degrade to dummy
-    mode rather than raising -- the rest of the graph stays exercisable."""
+def test_vlm_is_dummy_under_skip_weight_loading():
+    """skip_weight_loading builds no backbone (vlm is None) so the rest of the
+    graph stays exercisable on CPU; with real weights a load failure raises."""
     assert _model().get_submodule("vlm") is None
+
+
+def test_yaml_overrides_apply_and_unknown_keys_raise():
+    """Bug: model_kwargs from the yaml were dropped, so e.g. a 2-step config
+    silently ran 4 steps. Overrides must land; a typo must not pass silently."""
+    cls = get_model_class("gr00t_n17")
+    m = cls(model_path_hf="nvidia/GR00T-N1.7-3B", skip_weight_loading=True, num_inference_timesteps=2)
+    assert m.config.num_inference_timesteps == 2
+    with pytest.raises(ValueError, match="no_such_key"):
+        cls(model_path_hf="nvidia/GR00T-N1.7-3B", skip_weight_loading=True, no_such_key=1)
+
+
+def test_unreadable_hf_config_raises_with_real_weights(monkeypatch):
+    """Bug: a failed config.json fetch fell back to dataclass defaults, sizing
+    the model from values that may not match the checkpoint."""
+    import huggingface_hub
+
+    def boom(*a, **k):
+        raise OSError("offline")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", boom)
+    with pytest.raises(OSError, match="offline"):
+        get_model_class("gr00t_n17")(model_path_hf="nvidia/GR00T-N1.7-3B")
 
 
 def test_vlm_takes_the_qwen3vl_processor_contract():
@@ -247,7 +270,7 @@ def _frozen_conditioning(cfg, seq_len=6):
         # mixed layout: live image tokens, live text tokens, and padding
         "image_mask": [torch.tensor([True, True, False, False, False, False])],
         "backbone_attention_mask": [torch.tensor([True] * 5 + [False])],
-        "embodiment_id": [torch.tensor(1)],
+        "embodiment_id": [torch.tensor([1])],
     }
 
 

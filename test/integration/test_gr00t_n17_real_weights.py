@@ -58,8 +58,8 @@ def _dump_files() -> list[Path]:
     return sorted(Path(d).expanduser().glob("req_*.pt")) if d else []
 
 
+# CUDA is gated on the `nodes` fixture, so the decode-only test runs without a GPU.
 pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
     pytest.mark.skipif(
         not (_hf_cache_has(GR00T_REPO) and _hf_cache_has(BACKBONE_REPO)),
         reason=f"{GR00T_REPO} / {BACKBONE_REPO} not in local HF cache",
@@ -144,6 +144,8 @@ def device() -> str:
 def nodes(device):
     from mstar.model.registry import get_model_class
 
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     model = get_model_class("gr00t_n17")(model_path_hf=GR00T_REPO)
     vlm = model.get_submodule("vlm", device=device, autocast_dtype=DTYPE)
     enc = model.get_submodule("state_encoder", device=device, autocast_dtype=DTYPE)
@@ -292,13 +294,27 @@ def test_actions_match_reference(results):
     assert wmax <= 3 * FLOOR_ACTION_MAX, f"worst element {wmax:.4f} on {wmax_name} > {3 * FLOOR_ACTION_MAX}"
 
 
-def test_decoded_actions_match_reference(nodes, dumps, results):
-    """Robot-unit actions vs NVIDIA's ``decode_action`` (float64, before its float32 cast).
+def test_decode_alone_matches_reference(dumps):
+    """NVIDIA's own action_pred through our ``_decode_actions`` (raw state with
+    its [1, 1, D] history dim) vs its ``decode_action`` (float64, before its
+    float32 cast): float32 rounding only, <= 1e-6 (measured 1.2e-7). No GPU or
+    weights -- only the dumps and the HF metadata -- so CI without a GPU still
+    catches decode bugs (stats choice, relative add / SE(3) compose, group order)."""
+    from mstar.model.registry import get_model_class
 
-    * Decode alone (NVIDIA's own action_pred through our ``_decode_actions``,
-      raw state with its [1, 1, D] history dim): float32 rounding only, <= 1e-6
-      (measured 1.2e-7). Separates decode bugs (stats choice, relative add /
-      SE(3) compose, group order) from model bugs.
+    model = get_model_class("gr00t_n17")(model_path_hf=GR00T_REPO, skip_weight_loading=True)
+    alone = 0.0
+    for d in dumps.values():
+        ours = model._decode_actions(d["action_pred"][0].float().numpy(), d["embodiment_tag"].lower(),
+                                     d["raw_obs"]["state"])
+        alone = max(alone, float(np.abs(ours - _ref_decoded(d)).max()))
+    assert alone <= 1e-6, f"decode alone differs from NVIDIA's decode_action by {alone:.2e}"
+
+
+def test_decoded_actions_match_reference(nodes, dumps, results):
+    """Robot-unit actions vs NVIDIA's ``decode_action``; decode alone is
+    ``test_decode_alone_matches_reference``.
+
     * ``postprocess`` contract: no raw state -> normalized [40, 132] float32;
       raw state (HTTP path, flat lists) -> decoded [40, 17] float32.
     * Full chain, our actions through ``postprocess``: same multiples of the
@@ -306,13 +322,10 @@ def test_decoded_actions_match_reference(nodes, dumps, results):
       worst request <= 2 x 0.0079, worst element <= 3 x 0.084.
     """
     model = nodes["model"]
-    stats, alone = {}, 0.0
+    stats = {}
     for name, d in dumps.items():
         tag, ref = d["embodiment_tag"].lower(), _ref_decoded(d)
         horizon = ref.shape[0]
-        ours = model._decode_actions(d["action_pred"][0].float().numpy(), tag, d["raw_obs"]["state"])
-        alone = max(alone, float(np.abs(ours - ref).max()))
-
         act = results[name]["act_full"][0]
         flat_state = {k: d["raw_obs"]["state"][k][0, -1].tolist() for k in d["state_keys"]}
         normalized = model.postprocess(act, "action", None)
@@ -324,9 +337,8 @@ def test_decoded_actions_match_reference(nodes, dumps, results):
         stats[name] = {"mean": float(diff.mean()), "max": float(diff.max())}
 
     means = [s["mean"] for s in stats.values()]
-    print(f"\ndecode alone max |diff| {alone:.2e}; full-chain decoded mean |diff| avg {np.mean(means):.5f} "
+    print(f"\nfull-chain decoded mean |diff| avg {np.mean(means):.5f} "
           f"(min {min(means):.5f}, max {max(means):.5f}), worst element {max(s['max'] for s in stats.values()):.4f}")
-    assert alone <= 1e-6, f"decode alone differs from NVIDIA's decode_action by {alone:.2e}"
     avg = _avg(stats, lambda s: s["mean"])
     w_name, w = _worst(stats, lambda s: s["mean"])
     m_name, m = _worst(stats, lambda s: s["max"])
@@ -346,6 +358,26 @@ def test_submodules_in_eval_mode(nodes):
     for key in ("vlm", "enc", "dit"):
         training = [n for n, m in nodes[key].named_modules() if m.training]
         assert not training, f"{key}: modules in training mode: {training[:5]}"
+
+
+def test_first_step_noise_on_device_and_seeded(nodes):
+    """Bug: the first-step noise was drawn on CPU. It must come from the model's
+    device, and the same ``random_seed`` must reproduce it (served clients rely
+    on seed=rid matching ``torch.Generator('cuda').manual_seed(rid)``)."""
+    from types import SimpleNamespace
+
+    from mstar.model.gr00t_n17.submodules import Gr00tDiTSubmodule
+
+    dit = nodes["dit"]
+    cond = {k: [torch.zeros(1)] for k in Gr00tDiTSubmodule.FROZEN_INPUTS}
+
+    def noise(seed):
+        return dit.prepare_inputs("denoise", SimpleNamespace(random_seed=seed), cond).tensor_inputs["noisy_actions"]
+
+    a = noise(7)
+    assert a.device.type == "cuda", f"first-step noise drawn on {a.device}"
+    assert torch.equal(a, noise(7)), "same seed must reproduce the noise"
+    assert not torch.equal(a, noise(8)), "different seeds must give different noise"
 
 
 def test_backbone_rope_inv_freq_intact(nodes):
