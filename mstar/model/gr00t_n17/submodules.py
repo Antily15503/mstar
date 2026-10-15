@@ -110,7 +110,9 @@ class Gr00tStateEncoderSubmodule(NodeSubmodule):
         # are not visible to the next walk.
         return {
             "state_features": [features[i] for i in range(features.shape[0])],
-            "embodiment_id": [embodiment_id[i] for i in range(embodiment_id.shape[0])],
+            # Sliced, not indexed: (1,) rather than 0-d, because the conductor
+            # shards every graph-edge tensor on dim 0.
+            "embodiment_id": [embodiment_id[i : i + 1] for i in range(embodiment_id.shape[0])],
         }
 
 
@@ -195,8 +197,15 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         if actions is None:
             # First iteration: one Gaussian draw for the whole chunk. Every
             # later iteration refines this same tensor (Euler), so the noise is
-            # sampled exactly once per request.
-            actions = torch.randn(self.config.action_horizon, self.config.max_action_dim)
+            # sampled exactly once per request. Seeded from the conductor's
+            # per-request seed (as pi05 does) so a served request is
+            # reproducible, and drawn on the model's device.
+            device = self.get_device()
+            generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
+            actions = torch.randn(
+                self.config.action_horizon, self.config.max_action_dim,
+                device=device, generator=generator,
+            )
 
         step = _first("timestep_index")
         step = torch.tensor(0, dtype=torch.long) if step is None else step.reshape(())
@@ -248,9 +257,12 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         **kwargs,  # coming from preprocess output
     ) -> NameToTensorList:
         batch = noisy_actions.shape[0]
-        dtype = next(self.dit.parameters()).dtype
-        actions = noisy_actions.to(dtype)
-        embodiment_id = embodiment_id.long()
+        weight = next(self.dit.parameters())
+        dtype, device = weight.dtype, weight.device
+        # The first iteration's noise is drawn in prepare_inputs, on the CPU;
+        # every later iteration's arrives from the engine already on device.
+        actions = noisy_actions.to(device=device, dtype=dtype)
+        embodiment_id = embodiment_id.reshape(-1).long().to(device)  # [B, 1] off the edge -> [B]
 
         # Every request in a batch is on the same loop iteration, so one step
         # index drives the whole batch.
@@ -268,14 +280,14 @@ class Gr00tDiTSubmodule(NodeSubmodule):
 
         # State tokens lead, action tokens follow -- the decoder slices the
         # action tail back off below, so this order is load-bearing.
-        sa_embs = torch.cat([state_features.to(dtype), action_features], dim=1)
+        sa_embs = torch.cat([state_features.to(device=device, dtype=dtype), action_features], dim=1)
 
         model_output = self.dit(
             hidden_states=sa_embs,
-            encoder_hidden_states=vl_embeds.to(dtype),
+            encoder_hidden_states=vl_embeds.to(device=device, dtype=dtype),
             timestep=timesteps,
-            image_mask=image_mask.bool(),
-            backbone_attention_mask=backbone_attention_mask.bool(),
+            image_mask=image_mask.to(device).bool(),
+            backbone_attention_mask=backbone_attention_mask.to(device).bool(),
         )
         pred = self.action_decoder(model_output, embodiment_id)
 
@@ -283,7 +295,7 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         pred_velocity = pred[:, -self.config.action_horizon :]
         actions = actions + self.dt * pred_velocity
 
-        next_step = torch.tensor(step + 1, dtype=torch.long)
+        next_step = torch.tensor([step + 1], dtype=torch.long)  # (1,): crosses an edge
         return {
             "noisy_actions": [actions[i] for i in range(batch)],
             "timestep_index": [next_step.clone() for _ in range(batch)],
@@ -349,11 +361,19 @@ class Gr00tVLMSubmodule(NodeSubmodule):
     ) -> dict[str, torch.Tensor | Any]:
         # Sequential path is bs=1. Batching would need equal token counts (or
         # padding) across requests before this can stack; can_batch must gate it.
+        # Qwen3-VL's batch layout differs per key: token tensors get a batch
+        # dim, while pixel_values / image_grid_thw are flat across every image
+        # of every request (patches x dim, images x 3) -- concatenated, never
+        # stacked.
         out: dict[str, torch.Tensor | Any] = {}
         for name in self.HF_INPUTS:
             present = [i.tensor_inputs[name] for i in inputs if name in i.tensor_inputs]
-            if present:
-                out[name] = torch.stack(present, dim=0) if len(present) > 1 else present[0].unsqueeze(0)
+            if not present:
+                continue
+            if name in ("pixel_values", "image_grid_thw"):
+                out[name] = torch.cat(present, dim=0)
+            else:
+                out[name] = torch.stack(present, dim=0)
         return out
 
     def forward(
@@ -371,6 +391,12 @@ class Gr00tVLMSubmodule(NodeSubmodule):
             vl_input["pixel_values"] = pixel_values
         if image_grid_thw is not None:
             vl_input["image_grid_thw"] = image_grid_thw
+            # transformers >= 5 computes Qwen3-VL's 3D RoPE positions from
+            # mm_token_type_ids (0 text, 1 image, 2 video) and refuses to run
+            # without it; 4.57 (what the reference pins) derived them from
+            # input_ids. Same information, so derive it here rather than add
+            # a fifth graph input: image tokens are exactly image_token_id.
+            vl_input["mm_token_type_ids"] = (input_ids == self.image_token_id).long()
 
         outputs = self.backbone(**vl_input, output_hidden_states=True)
         # The LLM stack was truncated to ``select_layer`` at construction, so

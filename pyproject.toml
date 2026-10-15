@@ -218,6 +218,9 @@ gr00t_n17 = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
+    # Image eval transform: cv2.INTER_AREA, the filter the reference uses.
+    # torchvision's bilinear moved actions ~5x more than the whole model port.
+    "opencv-python-headless",
     "safetensors",
     # Qwen3-VL backbone (nvidia/Cosmos-Reason2-2B) is loaded via transformers.
     "transformers",

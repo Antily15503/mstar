@@ -258,6 +258,14 @@ def _tiny_dit_model():
     return m
 
 
+def _fwd_info(seed: int = 0):
+    """Stand-in for the engine's CurrentForwardPassInfo: the DiT only reads the
+    per-request seed (it seeds the first iteration's noise from it)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(random_seed=seed)
+
+
 def _frozen_conditioning(cfg, seq_len=6):
     """The conditioning the prefill walk would have persisted."""
     return {
@@ -285,7 +293,7 @@ def test_denoise_loop_runs_all_euler_steps():
         if actions is not None:
             inp["noisy_actions"] = [actions]
             inp["timestep_index"] = [step]
-        node_inputs = sub.prepare_inputs("denoise", None, inp)
+        node_inputs = sub.prepare_inputs("denoise", _fwd_info(), inp)
         out = sub.forward("denoise", None, **sub.preprocess("denoise", None, [node_inputs]))
         actions, step = out["noisy_actions"][0], out["timestep_index"][0]
         trajectory.append(actions.clone())
@@ -303,7 +311,7 @@ def test_denoise_first_iteration_seeds_its_own_noise():
     m = _tiny_dit_model()
     cfg = m.config
     sub = m.get_submodule("dit")
-    node_inputs = sub.prepare_inputs("denoise", None, _frozen_conditioning(cfg))
+    node_inputs = sub.prepare_inputs("denoise", _fwd_info(), _frozen_conditioning(cfg))
     assert node_inputs.tensor_inputs["noisy_actions"].shape == (
         cfg.action_horizon, cfg.max_action_dim,
     )
@@ -317,7 +325,7 @@ def test_denoise_requires_its_conditioning():
     del frozen["vl_embeds"]
     sub = m.get_submodule("dit")
     with pytest.raises(ValueError, match="vl_embeds"):
-        sub.prepare_inputs("denoise", None, frozen)
+        sub.prepare_inputs("denoise", _fwd_info(), frozen)
 
 
 def test_state_encoder_defaults_embodiment_id_when_absent():

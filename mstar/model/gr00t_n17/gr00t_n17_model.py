@@ -112,19 +112,58 @@ class Gr00tN17Model(Model):
     # ------------------------------------------------------------------
 
     def _load_config(self) -> GR00TConfig:
-        if self.skip_weight_loading:
-            return load_gr00t_config(None)  # defaults only
-        try:
+        hf_config = None
+        if not self.skip_weight_loading:
+            # No fallback to defaults: with real weights requested, a config we
+            # could not read must fail loudly, not silently size the model from
+            # dataclass defaults that may not match the checkpoint.
             from huggingface_hub import hf_hub_download
 
             config_path = hf_hub_download(
                 repo_id=self.model_path_hf, filename="config.json", cache_dir=self.cache_dir
             )
             with open(config_path) as f:
-                return load_gr00t_config(json.load(f))
-        except Exception as exc:
-            logger.warning("Could not load GR00T config from HF (%s); using defaults.", exc)
-            return load_gr00t_config(None)
+                hf_config = json.load(f)
+        cfg = load_gr00t_config(hf_config)
+        # yaml model_kwargs win over both the checkpoint and the defaults.
+        for key, value in self._yaml_config_overrides.items():
+            if not hasattr(cfg, key):
+                raise ValueError(f"Unknown GR00TConfig override {key!r} in model_kwargs")
+            setattr(cfg, key, value)
+        return cfg
+
+    # ------------------------------------------------------------------
+    # Weights
+    # ------------------------------------------------------------------
+
+    def _repo_dir(self) -> str:
+        """Local snapshot of the GR00T checkpoint (weights + index only)."""
+        if getattr(self, "_repo_dir_cache", None) is None:
+            from huggingface_hub import snapshot_download
+
+            self._repo_dir_cache = snapshot_download(
+                self.model_path_hf,
+                cache_dir=self.cache_dir,
+                allow_patterns=["*.json", "*.safetensors"],
+            )
+        return self._repo_dir_cache
+
+    def _load_checkpoint_prefix(self, module: torch.nn.Module, prefix: str) -> None:
+        """Strict-load every checkpoint tensor under ``prefix`` into ``module``.
+
+        The port keeps the reference's module names, so this is a prefix strip,
+        not a remap -- and ``strict=True`` is the check that it still is: a
+        missing or unexpected key raises instead of leaving random weights.
+        """
+        from mstar.model.loader.iterators import iter_safetensors_shards
+
+        state = {
+            key[len(prefix):]: tensor
+            for key, tensor in iter_safetensors_shards(self._repo_dir(), prefix=prefix)
+        }
+        if not state:
+            raise RuntimeError(f"No checkpoint tensors under {prefix!r} in {self.model_path_hf}")
+        module.load_state_dict(state, strict=True)
 
     # ------------------------------------------------------------------
     # Model ABC: structure
@@ -276,6 +315,9 @@ class Gr00tN17Model(Model):
     # Model ABC: I/O
     # ------------------------------------------------------------------
 
+    # Raw robot state stays in the data worker; the conductor never needs it.
+    PREPROCESS_ONLY_KWARGS = ("state",)
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -283,11 +325,27 @@ class Gr00tN17Model(Model):
         output_modalities: list[str],
         **kwargs,
     ) -> NameToTensorList:
-        # TODO(phase4): run the real Qwen3-VL processor here to turn
-        # prompt + images into input_ids / attention_mask / pixel_values /
-        # image_grid_thw. That processor ships with the GATED
-        # nvidia/Cosmos-Reason2-2B repo, so until access lands the caller
-        # supplies them directly (which is also what a parity harness does).
+        """Raw observation -> the tensors the three nodes consume.
+
+        Two entry points:
+
+        * **HTTP** (``POST /generate``): camera frames as uploaded files (the
+          data worker hands them over as ``tensors["image_inputs"]``, float CHW
+          in [0, 1], in upload order), the instruction as ``prompt``, and
+          ``model_kwargs = {"embodiment_tag": ..., "state": {key: [values]}}``
+          with the *raw* state per modality key. This mirrors Isaac-GR00T's
+          ``Gr00tN1d7Processor`` for inference: image eval transform, language
+          formalization, Qwen3-VL chat template + processor, percentile min-max
+          state normalization, embodiment-id lookup.
+        * **Pre-processed** (parity harness / tests): the processor's outputs
+          (``input_ids`` ...), ``state_inputs`` and ``embodiment_id`` passed
+          directly as kwargs.
+        """
+        tensors = kwargs.get("tensors") or {}
+        images = tensors.get("image_inputs")
+        if images and kwargs.get("state") is not None:
+            return self._process_observation(prompt or "", images, kwargs)
+
         out: NameToTensorList = {}
         for name in Gr00tVLMSubmodule.HF_INPUTS:
             value = kwargs.get(name)
@@ -296,7 +354,9 @@ class Gr00tN17Model(Model):
         embodiment_id = kwargs.get("embodiment_id")
         if embodiment_id is not None:
             out["embodiment_id"] = [
-                torch.as_tensor(embodiment_id, dtype=torch.long).reshape(())
+                # (1,), not 0-d: the conductor shards graph-edge tensors on
+                # dim 0, so every tensor crossing an edge needs one.
+                torch.as_tensor(embodiment_id, dtype=torch.long).reshape(1)
             ]
         state = kwargs.get("state_inputs", kwargs.get("robot_state"))
         if state is not None:
@@ -304,6 +364,102 @@ class Gr00tN17Model(Model):
                 state = torch.tensor(state, dtype=torch.float32)
             out["state_inputs"] = [state]
         return out
+
+    def _io_assets(self) -> dict:
+        """Processor + per-embodiment metadata, loaded once per process."""
+        if getattr(self, "_io_cache", None) is None:
+            from huggingface_hub import hf_hub_download
+            from transformers import AutoProcessor
+
+            def meta(name: str):
+                with open(hf_hub_download(self.model_path_hf, name, cache_dir=self.cache_dir)) as f:
+                    return json.load(f)
+
+            self._io_cache = {
+                "processor": AutoProcessor.from_pretrained(
+                    self.config.backbone_model_name, cache_dir=self.cache_dir
+                ),
+                "embodiment_ids": meta("embodiment_id.json"),
+                "statistics": meta("statistics.json"),
+                "modality_configs": meta("processor_config.json")["processor_kwargs"][
+                    "modality_configs"
+                ],
+            }
+        return self._io_cache
+
+    def _process_observation(self, prompt: str, images: list[torch.Tensor], kwargs: dict) -> NameToTensorList:
+        import re
+
+        import numpy as np
+
+        assets = self._io_assets()
+        tag = str(kwargs.get("embodiment_tag", "")).lower()
+        if tag not in assets["embodiment_ids"]:
+            raise ValueError(f"Unknown GR00T embodiment_tag {tag!r}")
+
+        # Images: Isaac-GR00T's eval transform, reproduced exactly --
+        # SmallestMaxSize(256, INTER_AREA) -> FractionalCenterCrop(0.95) ->
+        # SmallestMaxSize(256, INTER_AREA), with albumentations' own rounding.
+        # The filter matters: torchvision's bilinear (DROID frames are UPscaled
+        # 180 -> 256) moved actions ~5x more than the whole model port did.
+        import cv2
+
+        def shortest_edge_to(img: np.ndarray, size: int = 256) -> np.ndarray:
+            h, w = img.shape[:2]
+            scale = size / float(min(h, w))
+            if scale == 1.0:
+                return img
+            return cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+
+        frames = []
+        for img in images:
+            # The data worker decoded the upload to float [0, 1]; the round trip
+            # back to uint8 is exact for 8-bit sources.
+            hwc = (img.float().clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+            hwc = shortest_edge_to(hwc)
+            h, w = hwc.shape[:2]
+            ch, cw = max(1, int(h * 0.95)), max(1, int(w * 0.95))
+            y0, x0 = (h - ch) // 2, (w - cw) // 2
+            hwc = shortest_edge_to(hwc[y0 : y0 + ch, x0 : x0 + cw])
+            frames.append(torch.from_numpy(np.ascontiguousarray(hwc)).permute(2, 0, 1))
+
+        # Language: lowercase, strip punctuation (formalize_language=True),
+        # then one user turn holding every frame followed by the instruction.
+        text = re.sub(r"[^\w\s]", "", prompt.lower())
+        conversation = [{
+            "role": "user",
+            "content": [{"type": "image"} for _ in frames] + [{"type": "text", "text": text}],
+        }]
+        processor = assets["processor"]
+        chat = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=False)
+        vl = processor(text=[chat], images=frames, return_tensors="pt", padding=True)
+
+        # State: percentile min-max to [-1, 1] per modality key (use_percentiles,
+        # clip_outliers), concatenated in modality order, zero-padded.
+        stats = assets["statistics"][tag]["state"]
+        parts = []
+        for key in assets["modality_configs"][tag]["state"]["modality_keys"]:
+            x = np.asarray(kwargs["state"][key], dtype=np.float64).reshape(-1)
+            lo, hi = np.asarray(stats[key]["q01"]), np.asarray(stats[key]["q99"])
+            norm = np.zeros_like(x)
+            live = ~np.isclose(hi, lo)
+            norm[live] = 2 * (x[live] - lo[live]) / (hi[live] - lo[live]) - 1
+            parts.append(np.clip(norm, -1.0, 1.0))
+        state = np.concatenate(parts)
+        padded = np.zeros((self.config.state_history_length, self.config.max_state_dim), np.float32)
+        padded[:, : state.size] = state
+
+        return {
+            "input_ids": [vl["input_ids"][0]],
+            "attention_mask": [vl["attention_mask"][0]],
+            "pixel_values": [vl["pixel_values"]],
+            "image_grid_thw": [vl["image_grid_thw"]],
+            "state_inputs": [torch.from_numpy(padded)],
+            "embodiment_id": [torch.tensor([assets["embodiment_ids"][tag]], dtype=torch.long)],
+            # The raw frames are consumed here; replace them so the persisted
+            # request signals don't carry them for the request's lifetime.
+            "image_inputs": [],
+        }
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":
@@ -400,16 +556,29 @@ class Gr00tN17Model(Model):
     ) -> torch.nn.Module | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        # Allocate parameters directly in the serving dtype (docs/adding_models:
+        # "allocate params in autocast_dtype"). Building fp32 first and letting
+        # the engine cast afterwards would put ~8 GB of fp32 backbone on the
+        # device before the cast -- an OOM on small cards. The checkpoint is
+        # bf16, so nothing is lost; the reference also runs everything in bf16.
+        previous = torch.get_default_dtype()
+        if autocast_dtype is not None:
+            torch.set_default_dtype(autocast_dtype)
+        try:
+            submodule = self._create_submodule(node_name, device)
+        finally:
+            torch.set_default_dtype(previous)
+        if submodule is not None:
+            # Inference only. The engine never calls .eval(), and GR00T's bridge
+            # and DiT carry dropout=0.2 -- left in training mode, every request
+            # would get a different, wrong answer.
+            submodule.eval()
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded GR00T N1.7 submodule for %s", node_name)
         return submodule
 
     def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
-        # TODO(phase3): "vlm" (wrap HF Qwen3VLForConditionalGeneration) and
-        # "dit" (AlternateVLDiT). Returning None for those keeps them in dummy
-        # mode so the rest of the graph can be exercised meanwhile.
         if node_name == "state_encoder":
             self._init_state_encoder(device)
             return Gr00tStateEncoderSubmodule(
@@ -445,46 +614,52 @@ class Gr00tN17Model(Model):
             input_dim=self.config.max_state_dim * self.config.state_history_length,
             hidden_dim=self.config.dit_hidden_size,
             output_dim=self.config.input_embedding_dim,
-        ).to(device)
-        # TODO(phase4): load real weights; this is random-init until then.
+        )
+        if not self.skip_weight_loading:
+            self._load_checkpoint_prefix(self.state_encoder, "action_head.state_encoder.")
+        self.state_encoder.to(device)
 
     def _init_vlm(self, device: str) -> bool:
-        """Load the Qwen3-VL backbone and build the VL bridge.
+        """Build the Qwen3-VL backbone and the VL bridge, with GR00T's weights.
 
-        Returns False (leaving the node in dummy mode) when the backbone cannot
-        be loaded -- nvidia/Cosmos-Reason2-2B is a GATED repo, so this is the
-        expected path until an authorized HF token is available. Everything
-        else in the model is exercisable meanwhile.
+        Returns False (dummy mode) only under ``skip_weight_loading``. With real
+        weights requested, a failure raises -- a silently random backbone would
+        make every downstream parity number meaningless.
+
+        Only the backbone's *architecture* comes from Cosmos-Reason2-2B (its
+        config.json; the repo is gated). Every weight comes from the GR00T
+        checkpoint (``backbone.model.*``), which ships its own fine-tuned copy
+        of the backbone already truncated to ``select_layer`` LLM layers. The
+        reference downloads Cosmos's 4.9 GB of weights only to overwrite them;
+        we skip that.
         """
         if self.vlm is not None:
             return True
         if self.skip_weight_loading:
             return False
         cfg = self.config
-        try:
-            from transformers import Qwen3VLForConditionalGeneration
+        from transformers import AutoConfig, Qwen3VLForConditionalGeneration
 
-            backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                cfg.backbone_model_name, cache_dir=self.cache_dir
-            ).eval()
-        except Exception as exc:
-            logger.warning(
-                "Could not load the GR00T backbone %s (%s). The vlm node stays "
-                "in dummy mode; note the repo is gated and needs an authorized "
-                "HF token.",
-                cfg.backbone_model_name,
-                exc,
-            )
-            return False
-
+        vlm_config = AutoConfig.from_pretrained(cfg.backbone_model_name, cache_dir=self.cache_dir)
         # select_layer is applied by TRUNCATING the stack, not by indexing into
         # it: GR00T pops layers above select_layer so the last hidden state IS
-        # the selected one, and the layers above are never computed.
-        while len(backbone.language_model.layers) > cfg.select_layer:
-            backbone.language_model.layers.pop(-1)
+        # the selected one, and the layers above are never computed. Building
+        # with select_layer layers is the same truncation, done up front.
+        vlm_config.text_config.num_hidden_layers = cfg.select_layer
+        backbone = Qwen3VLForConditionalGeneration._from_config(
+            vlm_config, dtype=torch.get_default_dtype()
+        ).eval()
+        self._load_checkpoint_prefix(backbone, "backbone.model.")
+        # GR00T was trained on the last layer's PRE-norm output. Under the
+        # transformers it pins (4.57) that is what hidden_states[-1] holds;
+        # transformers 5.x puts the final-RMSNorm output there instead
+        # (measured: cosine 0.64 vs the reference until this line). GR00T never
+        # reads the norm's output (no lm_head), so dropping it makes
+        # hidden_states[-1] the pre-norm features on either version.
+        backbone.model.language_model.norm = torch.nn.Identity()
 
         self.vlm = backbone.to(device)
-        self._image_token_id = backbone.config.image_token_id
+        self._image_token_id = vlm_config.image_token_id
         # The VL bridge lives here rather than in the denoise loop -- see the
         # Gr00tVLMSubmodule docstring.
         self.vlln = (
@@ -502,9 +677,12 @@ class Gr00tN17Model(Model):
             if cfg.bridge_num_layers > 0
             else torch.nn.Identity()
         )
-        # TODO(phase4): load the bridge's real weights. Their checkpoint keys
-        # sit under the ACTION HEAD prefix (vlln.*, vl_self_attention.*) even
+        # The bridge's checkpoint keys sit under the ACTION HEAD prefix even
         # though this node owns the modules.
+        if cfg.use_vlln:
+            self._load_checkpoint_prefix(self.vlln, "action_head.vlln.")
+        if cfg.bridge_num_layers > 0:
+            self._load_checkpoint_prefix(self.vl_self_attention, "action_head.vl_self_attention.")
         return True
 
     def _init_dit(self, device: str):
@@ -546,4 +724,11 @@ class Gr00tN17Model(Model):
             if cfg.add_pos_embed
             else None
         )
-        # TODO(phase4): load real weights; this is random-init until then.
+        if not self.skip_weight_loading:
+            self._load_checkpoint_prefix(self.dit, "action_head.model.")
+            self._load_checkpoint_prefix(self.action_encoder, "action_head.action_encoder.")
+            self._load_checkpoint_prefix(self.action_decoder, "action_head.action_decoder.")
+            if self.position_embedding is not None:
+                self._load_checkpoint_prefix(
+                    self.position_embedding, "action_head.position_embedding."
+                )
