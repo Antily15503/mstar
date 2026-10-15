@@ -114,6 +114,10 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--dump-dir", default=None, help="save parity tensors for the mstar replay")
+    ap.add_argument("--obs-file", default=None,
+                    help="read pre-decoded observations (a torch-saved list of parsed obs) instead of decoding "
+                         "the dataset's videos -- for machines whose FFmpeg lacks an AV1 decoder, and to give "
+                         "every machine byte-identical inputs")
     ap.add_argument("--no-flash-attn", action="store_true",
                     help="hide flash_attn so the backbone falls back to SDPA (mstar's kernel). "
                          "Diffing this run against the default one gives the reference's own "
@@ -166,9 +170,14 @@ def main() -> None:
             captured["noise"] = t.detach().clone()
         return t
 
-    observations = list(_observations(
-        args.dataset_path, policy.get_modality_config(), args.num_warmup + args.num_requests, args.stride
-    ))
+    if args.obs_file:
+        loaded = torch.load(args.obs_file, weights_only=False)
+        # warmup reuses the first observations; the timed requests are the file's, in order
+        observations = [loaded[i % len(loaded)] for i in range(args.num_warmup)] + loaded[: args.num_requests]
+    else:
+        observations = list(_observations(
+            args.dataset_path, policy.get_modality_config(), args.num_warmup + args.num_requests, args.stride
+        ))
     if len(observations) < args.num_warmup + args.num_requests:
         raise SystemExit(f"dataset yielded only {len(observations)} observations")
 
