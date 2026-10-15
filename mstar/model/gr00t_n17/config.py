@@ -123,6 +123,13 @@ class GR00TConfig:
     max_seq_len: int = 1024
     model_dtype: str = "bfloat16"
 
+    # ----- Serving (M*-only; not in the HF config) -----
+    # The DiT pads the VLM context to this many tokens so its CUDA graphs see
+    # one shape. Measured: DROID ~480, 3-camera 320x240 ~560, 16:9 cameras ~710;
+    # long instructions add the rest. Longer contexts fail that request.
+    cuda_graph_context_len: int = 1024
+    cuda_graph_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+
     extra: dict = field(default_factory=dict)
 
 

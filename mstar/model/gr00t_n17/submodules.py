@@ -19,6 +19,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
 from mstar.model.gr00t_n17.components.dit import AlternateVLDiT
 from mstar.model.gr00t_n17.components.embodiment_mlp import (
     CategorySpecificMLP,
@@ -92,6 +93,12 @@ class Gr00tStateEncoderSubmodule(NodeSubmodule):
             [i.tensor_inputs["embodiment_id"] for i in inputs], dim=0
         )
         return {"state": state, "embodiment_id": embodiment_id}
+
+    def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
+        return True
+
+    def forward_batched(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs):
+        return _per_request(self.forward(graph_walk, engine_inputs, **kwargs), engine_inputs.request_ids)
 
     def forward(
         self,
@@ -177,11 +184,6 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         """Euler step size: the schedule is traversed in N equal steps."""
         return 1.0 / self.config.num_inference_timesteps
 
-    def _discretize(self, step: int) -> int:
-        """Continuous time t/N -> one of ``num_timestep_buckets`` buckets."""
-        t_cont = step / float(self.config.num_inference_timesteps)
-        return int(t_cont * self.config.num_timestep_buckets)
-
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -208,7 +210,7 @@ class Gr00tDiTSubmodule(NodeSubmodule):
             )
 
         step = _first("timestep_index")
-        step = torch.tensor(0, dtype=torch.long) if step is None else step.reshape(())
+        step = torch.zeros(1, dtype=torch.long) if step is None else step.reshape(1)
 
         tensors: dict[str, torch.Tensor] = {"noisy_actions": actions, "timestep_index": step}
         for name in self.FROZEN_INPUTS:
@@ -219,6 +221,13 @@ class Gr00tDiTSubmodule(NodeSubmodule):
                     "it should arrive from the prefill walk's persist signals"
                 )
             tensors[name] = value
+        # Checked per request here (the engine fails just this request), not in
+        # preprocess, where a raise would fail the whole batch.
+        if tensors["vl_embeds"].shape[0] > self.config.cuda_graph_context_len:
+            raise ValueError(
+                f"VLM context of {tensors['vl_embeds'].shape[0]} tokens exceeds "
+                f"cuda_graph_context_len={self.config.cuda_graph_context_len}"
+            )
         return NodeInputs(tensor_inputs=tensors)
 
     def preprocess(
@@ -227,20 +236,29 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        # Batching stacks the context, so it requires equal VLM sequence length
-        # across the batch. can_batch must enforce that before this is enabled;
-        # the sequential path is bs=1.
+        # The VLM context varies per request (prompt length); pad it to one fixed
+        # length so every batch has the shapes the CUDA graphs captured (and
+        # compiled code never recompiles on a new prompt length). The pad is
+        # masked out of backbone_attention_mask, which every cross-attention
+        # honours, so it changes no row beyond kernel noise (~2 bf16 ulps).
+        n, device = self.config.cuda_graph_context_len, self.get_device()
+
         def _stack(name: str) -> torch.Tensor:
-            return torch.stack([i.tensor_inputs[name] for i in inputs], dim=0)
+            # First-step inputs are built here, later ones come off the engine on
+            # device; a batch can mix both.
+            ts = [i.tensor_inputs[name].to(device) for i in inputs]
+            if name in ("vl_embeds", "image_mask", "backbone_attention_mask"):
+                ts = [torch.cat([t, t.new_zeros((n - t.shape[0], *t.shape[1:]))]) for t in ts]
+            return torch.stack(ts, dim=0)
 
         return {
             "noisy_actions": _stack("noisy_actions"),                   # [B, H, action_dim]
-            "timestep_index": _stack("timestep_index"),                 # [B]
+            "timestep_index": _stack("timestep_index"),                 # [B, 1]
             "state_features": _stack("state_features"),                 # [B, 1, emb]
             "vl_embeds": _stack("vl_embeds"),                           # [B, S, backbone_dim]
             "image_mask": _stack("image_mask"),                         # [B, S]
             "backbone_attention_mask": _stack("backbone_attention_mask"),  # [B, S]
-            "embodiment_id": _stack("embodiment_id"),                   # [B]
+            "embodiment_id": _stack("embodiment_id"),                   # [B, 1]
         }
 
     def forward(
@@ -259,17 +277,15 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         batch = noisy_actions.shape[0]
         weight = next(self.dit.parameters())
         dtype, device = weight.dtype, weight.device
-        # The first iteration's noise is drawn in prepare_inputs, on the CPU;
-        # every later iteration's arrives from the engine already on device.
         actions = noisy_actions.to(device=device, dtype=dtype)
         embodiment_id = embodiment_id.reshape(-1).long().to(device)  # [B, 1] off the edge -> [B]
 
-        # Every request in a batch is on the same loop iteration, so one step
-        # index drives the whole batch.
-        step = int(timestep_index.reshape(-1)[0].item())
-        timesteps = torch.full(
-            (batch,), self._discretize(step), device=actions.device, dtype=torch.long
-        )
+        # Per request: nothing keeps batched requests on the same loop iteration.
+        # Device-side only (no .item()), so the step is CUDA-graph capturable.
+        step = timestep_index.reshape(-1).to(device)
+        timesteps = (
+            step.double() / self.config.num_inference_timesteps * self.config.num_timestep_buckets
+        ).long()
 
         action_features = self.action_encoder(actions, timesteps, embodiment_id)
         if self.position_embedding is not None:
@@ -295,11 +311,40 @@ class Gr00tDiTSubmodule(NodeSubmodule):
         pred_velocity = pred[:, -self.config.action_horizon :]
         actions = actions + self.dt * pred_velocity
 
-        next_step = torch.tensor([step + 1], dtype=torch.long)  # (1,): crosses an edge
+        next_step = step + 1
         return {
             "noisy_actions": [actions[i] for i in range(batch)],
-            "timestep_index": [next_step.clone() for _ in range(batch)],
+            "timestep_index": [next_step[i : i + 1] for i in range(batch)],  # (1,): crosses an edge
         }
+
+    def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
+        return True
+
+    def forward_batched(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs):
+        return _per_request(self.forward(graph_walk, engine_inputs, **kwargs), engine_inputs.request_ids)
+
+    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
+        """One denoise step, captured per batch size at the fixed context length.
+
+        The dummy row (batch padding) keeps one image token and every context
+        token live, so no cross-attention row is fully masked.
+        """
+        n, cfg = self.config.cuda_graph_context_len, self.config
+        dtype = next(self.dit.parameters()).dtype
+        row = NodeInputs(tensor_inputs={
+            "noisy_actions": torch.zeros(cfg.action_horizon, cfg.max_action_dim, device=device),
+            "timestep_index": torch.zeros(1, dtype=torch.long, device=device),
+            "state_features": torch.zeros(1, cfg.input_embedding_dim, device=device, dtype=dtype),
+            "vl_embeds": torch.zeros(n, cfg.backbone_embedding_dim, device=device, dtype=dtype),
+            "image_mask": torch.arange(n, device=device) == 0,
+            "backbone_attention_mask": torch.ones(n, dtype=torch.bool, device=device),
+            "embodiment_id": torch.zeros(1, dtype=torch.long, device=device),
+        })
+        return [BatchedCudaGraphConfig(
+            capture_graph_walk="denoise",
+            single_request_inputs=row,
+            capture_batch_sizes=cfg.cuda_graph_batch_sizes,
+        )]
 
 
 class Gr00tVLMSubmodule(NodeSubmodule):
@@ -420,3 +465,8 @@ class Gr00tVLMSubmodule(NodeSubmodule):
             "image_mask": [image_mask[i] for i in range(batch)],
             "backbone_attention_mask": [backbone_attention_mask[i] for i in range(batch)],
         }
+
+
+def _per_request(outputs: NameToTensorList, request_ids) -> dict:
+    """``forward``'s per-request lists (batch order) -> ``forward_batched``'s {rid: outputs}."""
+    return {rid: {name: [ts[i]] for name, ts in outputs.items()} for i, rid in enumerate(request_ids)}
