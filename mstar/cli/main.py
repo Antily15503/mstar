@@ -44,6 +44,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
     "pi05": "pi05.yaml",
+    "gr00t_n17": "gr00t_n17.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
     # ASR (Beta, un-optimized) — audio in, transcript out.
@@ -159,9 +160,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model == "qwen3_tts_base":
         lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
                      "ref_text=\"...\").to_wav(\"out.wav\")")
-    if model in ("pi05", "vjepa2", "vjepa2_ac"):
+    if model in ("pi05", "gr00t_n17", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
-                     ("action" if model == "pi05" else "video") + "\",))")
+                     ("action" if model in ("pi05", "gr00t_n17") else "video") + "\",))")
     if model in ("whisper_large", "higgs_audio"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")

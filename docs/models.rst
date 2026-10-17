@@ -58,6 +58,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+   * - ``gr00t_n17``
+     - ``nvidia/GR00T-N1.7-3B``
+     - GR00T N1.7 vision-language-action robotics model (Qwen3-VL backbone + flow-matching
+       DT action head); actions returned in robot units.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
