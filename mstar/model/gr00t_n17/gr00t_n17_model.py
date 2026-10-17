@@ -715,6 +715,12 @@ class Gr00tN17Model(Model):
         # reads the norm's output (no lm_head), so dropping it makes
         # hidden_states[-1] the pre-norm features on either version.
         backbone.model.language_model.norm = torch.nn.Identity()
+        # Round the RoPE frequencies to the serving dtype, as NVIDIA's model.to(dtype) does. Same
+        # distance from an fp32 run either way (0.0038), and it makes the port bit-exact to NVIDIA's code.
+        serve_dtype = next(backbone.parameters()).dtype
+        for name, buf in backbone.named_buffers():
+            if name.endswith("inv_freq"):
+                buf.copy_(buf.to(serve_dtype).float())
 
         self.vlm = backbone.to(device)
         self._image_token_id = vlm_config.image_token_id

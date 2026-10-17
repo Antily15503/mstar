@@ -6,7 +6,8 @@ Reference: per-request dumps from ``benchmark/isaac_gr00t_n17.py --dump-dir D``
 initial noise, intermediates, the normalized ``action_pred`` [1, 40, 132] (dims
 17.. are padding) and ``decoded_action`` (robot units). The real checkpoint is
 loaded once per module (~2 min) and every dump is replayed through the nodes'
-``forward`` with NVIDIA's noise -- no server, no engine.
+``forward`` with noise from the node's own seeded path (seed = rid, asserted
+equal to NVIDIA's recorded noise) -- no server, no engine.
 
 Skipped unless CUDA, both HF repos are cached, and GR00T_PARITY_DUMP_DIR is set::
 
@@ -99,6 +100,18 @@ def _run_enc(enc, inp: dict, device: str) -> torch.Tensor:
     return torch.stack(enc.forward("prefill", None, state=state, embodiment_id=emb)["state_features"])
 
 
+def _seeded_noise(dit, seed: int) -> torch.Tensor:
+    """First-step noise from the node's own seeded path, i.e. what a served request
+    with ``seed`` draws: ``[1, action_horizon, max_action_dim]``."""
+    from types import SimpleNamespace
+
+    from mstar.model.gr00t_n17.submodules import Gr00tDiTSubmodule
+
+    cond = {k: [torch.zeros(1)] for k in Gr00tDiTSubmodule.FROZEN_INPUTS}
+    fwd = SimpleNamespace(random_seed=seed)
+    return dit.prepare_inputs("denoise", fwd, cond).tensor_inputs["noisy_actions"].unsqueeze(0)
+
+
 def _run_dit(dit, noise, cond: dict, embodiment_id, steps: int) -> torch.Tensor:
     actions = noise
     for step in range(steps):
@@ -182,7 +195,8 @@ def results(nodes, dumps, device) -> dict[str, dict]:
             vl = _run_vlm(vlm, inp, device)
             sf = _run_enc(enc, inp, device)
             emb = inp["embodiment_id"].to(device).long()
-            noise = d["noise"].to(device)
+            # Our seeded draw, not the dump's copy (NVIDIA drew it with seed = rid).
+            noise = _seeded_noise(dit, d["seed"])
             ours_cond = {**vl, "state_features": sf}
             ref_cond = {"vl_embeds": d["vl_embeds"].to(device), "state_features": d["state_features"].to(device),
                         **{k: v.to(device) for k, v in ref_masks.items()}}
@@ -192,6 +206,7 @@ def results(nodes, dumps, device) -> dict[str, dict]:
             out[name] = {
                 "vl_cos_mean": vl_cos.mean().item(),
                 "sf_max_abs": (sf.float().cpu() - d["state_features"].float()).abs().max().item(),
+                "noise_is_reference": torch.equal(noise.to(d["noise"].dtype).cpu(), d["noise"]),
                 "masks_equal": all(torch.equal(vl[k].cpu(), v) for k, v in ref_masks.items()),
                 "iso": _act_err(act_iso, d["action_pred"]),
                 "full": _act_err(act_full, d["action_pred"]),
@@ -360,20 +375,18 @@ def test_submodules_in_eval_mode(nodes):
         assert not training, f"{key}: modules in training mode: {training[:5]}"
 
 
-def test_first_step_noise_on_device_and_seeded(nodes):
+def test_first_step_noise_on_device_and_seeded(nodes, results):
     """Bug: the first-step noise was drawn on CPU. It must come from the model's
-    device, and the same ``random_seed`` must reproduce it (served clients rely
-    on seed=rid matching ``torch.Generator('cuda').manual_seed(rid)``)."""
-    from types import SimpleNamespace
-
-    from mstar.model.gr00t_n17.submodules import Gr00tDiTSubmodule
-
+    device, the same ``random_seed`` must reproduce it, and seed = rid must give
+    NVIDIA's own noise: the parity replay draws its noise this way, so every
+    action comparison runs on noise our serving path generates."""
     dit = nodes["dit"]
-    cond = {k: [torch.zeros(1)] for k in Gr00tDiTSubmodule.FROZEN_INPUTS}
 
     def noise(seed):
-        return dit.prepare_inputs("denoise", SimpleNamespace(random_seed=seed), cond).tensor_inputs["noisy_actions"]
+        return _seeded_noise(dit, seed)
 
+    bad = [n for n, r in results.items() if not r["noise_is_reference"]]
+    assert not bad, f"seeded noise differs from NVIDIA's recorded noise: {bad}"
     a = noise(7)
     assert a.device.type == "cuda", f"first-step noise drawn on {a.device}"
     assert torch.equal(a, noise(7)), "same seed must reproduce the noise"
@@ -383,37 +396,58 @@ def test_first_step_noise_on_device_and_seeded(nodes):
 def test_backbone_rope_inv_freq_intact(nodes):
     """RoPE ``inv_freq`` is a non-persistent buffer (not in the checkpoint, so the
     strict load cannot catch it) and we build under ``set_default_dtype(bf16)``;
-    a bf16 inv_freq silently degrades every position. Every inv_freq must be
-    fp32 and the text one must equal a fresh recomputation."""
+    a bf16-computed inv_freq silently degrades every position. For both rotaries
+    (vision and text), inv_freq and original_inv_freq must be fp32 holding a fresh
+    fp32 recomputation rounded to the serving dtype, which is what NVIDIA's
+    model.to(dtype) leaves them as."""
     backbone = nodes["vlm"].backbone
-    bufs = {n: b for n, b in backbone.named_buffers() if n.endswith("inv_freq")}
-    assert bufs, "no inv_freq buffers found -- transformers layout changed?"
-    for name, buf in bufs.items():
-        assert buf.dtype == torch.float32 and torch.isfinite(buf).all(), f"{name}: {buf.dtype}"
-    rotary = backbone.model.language_model.rotary_emb
-    if rotary.rope_type == "default":
-        expected, _ = rotary.compute_default_rope_parameters(rotary.config)
-        torch.testing.assert_close(rotary.inv_freq.cpu(), expected.float().cpu(), rtol=0, atol=0)
+    serve_dtype = next(backbone.parameters()).dtype
+    for rotary in (backbone.model.visual.rotary_pos_emb, backbone.model.language_model.rotary_emb):
+        previous = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        try:
+            with torch.device("cpu"):
+                fresh = type(rotary)(rotary.config)
+        finally:
+            torch.set_default_dtype(previous)
+        expected = fresh.inv_freq.float().to(serve_dtype).float()
+        for name in ("inv_freq", "original_inv_freq"):
+            buf = getattr(rotary, name)
+            assert buf.dtype == torch.float32, f"{type(rotary).__name__}.{name}: {buf.dtype}"
+            torch.testing.assert_close(buf.cpu(), expected, rtol=0, atol=0,
+                                       msg=f"{type(rotary).__name__}.{name} differs from the expected frequencies")
 
 
 def test_batch_of_two_matches_singles(nodes, dumps, results, device):
-    """Two requests through prepare_inputs -> preprocess -> forward, the engine's
-    collation path, must reproduce the single runs.
+    """Requests through prepare_inputs -> preprocess -> forward in batches of two,
+    the engine's collation path.
 
     Guards: pixel_values must be CONCATENATED across the batch (the vision tower
     takes flat patches + image_grid_thw), not stacked; and every tensor a node
     emits must be >= 1-d, because the conductor shards edges on dim 0 (0-d
-    embodiment_id / timestep_index crashed it). Bars: below the kernel floor --
-    actions mean <= 0.0017, vl_embeds cosine >= 0.999 (a cross-request leak or a
-    misaligned concat is far larger)."""
+    embodiment_id / timestep_index crashed it).
+
+    Leak check, exact: a request's batched output depends on neither its partner
+    nor its row (batching changes kernel shapes, not which rows mix), so A as row 0
+    of (A, B) must equal A as row 1 of (C, A) bit for bit. A leak in either
+    direction breaks that; a threshold could not see a 3% leak, which sits inside
+    batching noise.
+
+    Batched vs single is not bit-exact (a batch of two tiles its matmuls
+    differently), so those bars only catch gross errors such as a misaligned
+    concat. Measured over all 94 equal-length pairs: worst action mean 0.0027,
+    worst vl_embeds cosine 0.99887. Bars: action mean <= 2 x floor = 0.0034,
+    cosine >= 0.998."""
     names = list(dumps)
-    pair = next(
-        ((a, b) for i, a in enumerate(names) for b in names[i + 1:]
-         if _inputs(dumps[a])["input_ids"].shape == _inputs(dumps[b])["input_ids"].shape),
+    shape = {n: _inputs(dumps[n])["input_ids"].shape for n in names}
+    trio = next(
+        ((a, b, c) for a in names for b in names for c in names
+         if a != b and a != c and b < c and shape[a] == shape[b] == shape[c]),
         None,
     )
-    if pair is None:
-        pytest.skip("no two dumps with equal token counts (the DiT stacks vl_embeds)")
+    if trio is None:
+        pytest.skip("no three dumps with equal token counts (the DiT stacks vl_embeds)")
+    a, b, c = trio
     vlm, enc, dit = nodes["vlm"], nodes["enc"], nodes["dit"]
     emitted: list[tuple[str, torch.Tensor]] = []
 
@@ -424,42 +458,50 @@ def test_batch_of_two_matches_singles(nodes, dumps, results, device):
     def edge(t):
         return [t.to(device)]
 
-    with torch.inference_mode():
-        vlm_in = [vlm.prepare_inputs("prefill", None, {
-            "input_ids": edge(_inputs(dumps[n])["input_ids"][0]),
-            "attention_mask": edge(_inputs(dumps[n])["attention_mask"][0]),
-            "pixel_values": edge(_inputs(dumps[n])["pixel_values"].to(DTYPE)),
-            "image_grid_thw": edge(_inputs(dumps[n])["image_grid_thw"]),
-        }) for n in pair]
-        vl_out = record("vlm", vlm.forward("prefill", None, **vlm.preprocess("prefill", None, vlm_in)))
-        enc_in = [enc.prepare_inputs("prefill", None, {
-            "state_inputs": edge(_inputs(dumps[n])["state"][0].to(DTYPE)),
-            "embodiment_id": edge(_inputs(dumps[n])["embodiment_id"]),
-        }) for n in pair]
-        enc_out = record("state_encoder", enc.forward("prefill", None, **enc.preprocess("prefill", None, enc_in)))
+    def run_batched(pair):
+        with torch.inference_mode():
+            vlm_in = [vlm.prepare_inputs("prefill", None, {
+                "input_ids": edge(_inputs(dumps[n])["input_ids"][0]),
+                "attention_mask": edge(_inputs(dumps[n])["attention_mask"][0]),
+                "pixel_values": edge(_inputs(dumps[n])["pixel_values"].to(DTYPE)),
+                "image_grid_thw": edge(_inputs(dumps[n])["image_grid_thw"]),
+            }) for n in pair]
+            vl_out = record("vlm", vlm.forward("prefill", None, **vlm.preprocess("prefill", None, vlm_in)))
+            enc_in = [enc.prepare_inputs("prefill", None, {
+                "state_inputs": edge(_inputs(dumps[n])["state"][0].to(DTYPE)),
+                "embodiment_id": edge(_inputs(dumps[n])["embodiment_id"]),
+            }) for n in pair]
+            enc_out = record("state_encoder", enc.forward("prefill", None, **enc.preprocess("prefill", None, enc_in)))
 
-        loop = {"noisy_actions": [dumps[n]["noise"][0].to(device) for n in pair], "timestep_index": [None, None]}
-        for _ in range(nodes["steps"]):
-            dit_in = [dit.prepare_inputs("denoise", None, {
-                "noisy_actions": [loop["noisy_actions"][i]],
-                "timestep_index": [] if loop["timestep_index"][i] is None else [loop["timestep_index"][i]],
-                "state_features": [enc_out["state_features"][i]],
-                "embodiment_id": [enc_out["embodiment_id"][i]],
-                **{k: [vl_out[k][i]] for k in ("vl_embeds", "image_mask", "backbone_attention_mask")},
-            }) for i in range(2)]
-            loop = record("dit", dit.forward("denoise", None, **dit.preprocess("denoise", None, dit_in)))
+            loop = {"noisy_actions": [_seeded_noise(dit, dumps[n]["seed"])[0] for n in pair], "timestep_index": [None, None]}
+            for _ in range(nodes["steps"]):
+                dit_in = [dit.prepare_inputs("denoise", None, {
+                    "noisy_actions": [loop["noisy_actions"][i]],
+                    "timestep_index": [] if loop["timestep_index"][i] is None else [loop["timestep_index"][i]],
+                    "state_features": [enc_out["state_features"][i]],
+                    "embodiment_id": [enc_out["embodiment_id"][i]],
+                    **{k: [vl_out[k][i]] for k in ("vl_embeds", "image_mask", "backbone_attention_mask")},
+                }) for i in range(2)]
+                loop = record("dit", dit.forward("denoise", None, **dit.preprocess("denoise", None, dit_in)))
+        return vl_out, enc_out, loop
+
+    vl_ab, enc_ab, loop_ab = run_batched((a, b))
+    vl_ca, _, loop_ca = run_batched((c, a))
 
     zero_d = sorted({n for n, t in emitted if t.dim() == 0})
     assert not zero_d, f"0-d tensors on graph edges: {zero_d}"
-    prompt = nodes["model"].process_prompt(None, [], [], embodiment_id=int(_inputs(dumps[pair[0]])["embodiment_id"][0]))
+    prompt = nodes["model"].process_prompt(None, [], [], embodiment_id=int(_inputs(dumps[a])["embodiment_id"][0]))
     assert prompt["embodiment_id"][0].shape == (1,), "process_prompt emits a 0-d embodiment_id"
-    assert [int(t) for t in loop["timestep_index"]] == [nodes["steps"]] * 2, "timestep_index must advance once per step"
+    assert [int(t) for t in loop_ab["timestep_index"]] == [nodes["steps"]] * 2, "timestep_index must advance once per step"
 
-    for i, n in enumerate(pair):
-        cos = _token_cos(vl_out["vl_embeds"][i], results[n]["cond"]["vl_embeds"]).mean().item()
-        assert cos >= 0.999, f"{n}: batched vl_embeds cosine vs single {cos:.5f}"
-        assert torch.equal(enc_out["state_features"][i].cpu(), results[n]["cond"]["state_features"][0].cpu()), (
+    assert torch.equal(vl_ab["vl_embeds"][0], vl_ca["vl_embeds"][1]), f"{a}: vl_embeds depend on the batch partner or row"
+    assert torch.equal(loop_ab["noisy_actions"][0], loop_ca["noisy_actions"][1]), f"{a}: actions depend on the batch partner or row"
+
+    for i, n in enumerate((a, b)):
+        cos = _token_cos(vl_ab["vl_embeds"][i], results[n]["cond"]["vl_embeds"]).mean().item()
+        assert cos >= 0.998, f"{n}: batched vl_embeds cosine vs single {cos:.5f}"
+        assert torch.equal(enc_ab["state_features"][i].cpu(), results[n]["cond"]["state_features"][0].cpu()), (
             f"{n}: batched state_features differ from single"
         )
-        err = _act_err(loop["noisy_actions"][i].unsqueeze(0), results[n]["act_full"])
-        assert err["mean132"] <= FLOOR_ACTION_MEAN, f"{n}: batched actions mean |diff| vs single {err['mean132']:.5f}"
+        err = _act_err(loop_ab["noisy_actions"][i].unsqueeze(0), results[n]["act_full"])
+        assert err["mean132"] <= 2 * FLOOR_ACTION_MEAN, f"{n}: batched actions mean |diff| vs single {err['mean132']:.5f}"
