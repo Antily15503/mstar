@@ -47,6 +47,25 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
      - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
        stochastic sampler); TP=2 deployments.
+   * - ``gr00t_n17`` *(Beta)*
+     - ``nvidia/GR00T-N1.7-3B``
+     - Vision-language-action robotics model: a Qwen3-VL backbone cut to 16 layers
+       with DeepStack, and a 32-block flow-matching action head that denoises a
+       40-step action chunk in four steps. One request is a language instruction
+       plus the robot's camera views and its proprioceptive state; the reply is
+       msgpack, one entry per joint group, each with its ``dtype``, ``shape`` and
+       raw ``data``. Request knobs: ``embodiment_tag`` (the checkpoint's own
+       spelling, matched case-insensitively — eight are shipped, and the error
+       lists them), ``video`` as ``{camera: uint8 (1, T, H, W, 3)}``, ``state`` as
+       ``{joint_group: float32 (1, T, D)}`` — one request at a time, and the
+       camera and joint-group names are the embodiment's own — and ``walk``, which
+       selects one of the two reuse walks (``backbone`` or ``state``) instead of
+       running the full path. Video must be ``uint8``: the image processor
+       rescales by 1/255 whatever it is given, so pre-normalised frames reach the
+       model as a black image. The backbone's config **and its tokenizer and image
+       processor** come from the **gated** ``nvidia/Cosmos-Reason2-2B``; accept its
+       terms on the Hub first. Needs the ``gr00t_n17`` extra for OpenCV, whose
+       ``INTER_AREA`` resize the reference's image transform uses.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
