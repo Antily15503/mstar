@@ -74,6 +74,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
+    "gr00t_n17": "gr00t_n17.yaml",
 }
 
 # qwen 3.5 series (dense)
