@@ -1,4 +1,4 @@
-"""A SmolVLA request's text, state and actions, as LeRobot's deployment prepares them.
+"""A SmolVLA request's frames, text, state and actions, as LeRobot's deployment prepares them.
 
 Normalization (D03) reads the checkpoint's own processor files: stats are looked
 up by feature name, and a feature without them passes through unchanged
@@ -8,10 +8,12 @@ being keyed by pretraining dataset (D08).
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file
 
 STATE = "observation.state"
@@ -22,6 +24,26 @@ class MeanStd(NamedTuple):
     mean: torch.Tensor
     std: torch.Tensor
     eps: float
+
+
+def prepare_images(frames: Sequence[torch.Tensor], width: int, height: int) -> torch.Tensor:
+    """Camera frames (uint8 HxWx3, on the GPU) as SigLIP takes them: ``[n, 3, height, width]`` in [-1, 1].
+
+    As LeRobot's deployment does it (D07): ``/ 255`` on the device, which on CUDA
+    is ``u8 * (1/255)`` and not the CPU's division; the frame scaled to fit and
+    padded on the left and top with 0 (`vla_utils.py:225-242`); then ``x * 2 - 1``.
+    """
+    images = []
+    for frame in frames:
+        image = (frame.float() / 255).permute(2, 0, 1)[None]
+        h, w = image.shape[2:]
+        if (h, w) != (height, width):
+            ratio = max(w / width, h / height)
+            rh, rw = int(h / ratio), int(w / ratio)
+            image = F.interpolate(image, size=(rh, rw), mode="bilinear", align_corners=False)
+            image = F.pad(image, (width - rw, 0, height - rh, 0), value=0)
+        images.append(image * 2.0 - 1.0)
+    return torch.cat(images)
 
 
 def tokenize(tokenizer, task: str, max_length: int) -> torch.Tensor:
@@ -62,7 +84,7 @@ def normalize_state(state: torch.Tensor, stats: MeanStd | None, max_state_dim: i
     """``(x - mean) / (std + eps)``, then zero-padded to ``max_state_dim``."""
     if stats is not None:
         state = (state - stats.mean.to(state)) / (stats.std.to(state) + stats.eps)
-    return torch.nn.functional.pad(state, (0, max_state_dim - state.shape[-1]))
+    return F.pad(state, (0, max_state_dim - state.shape[-1]))
 
 
 def unnormalize_actions(chunk: torch.Tensor, stats: MeanStd | None, action_dim: int) -> torch.Tensor:
