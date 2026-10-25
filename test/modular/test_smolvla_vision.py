@@ -1,13 +1,14 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import load_file
-from transformers.models.smolvlm.modeling_smolvlm import SmolVLMVisionConfig, SmolVLMVisionTransformer
+from transformers.models.smolvlm.modeling_smolvlm import SmolVLMConnector, SmolVLMVisionConfig, SmolVLMVisionTransformer
 
 from mstar.model.smolvla.config import SmolVLAConfig, SmolVLAVisionConfig
-from mstar.model.smolvla.vision import siglip_tower
+from mstar.model.smolvla.vision import SmolVLAConnector, pixel_shuffle, siglip_tower
 from mstar.model.smolvla.weight_loader import load_smolvla_weights
 
 TINY = dict(hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
@@ -65,3 +66,42 @@ def test_real_checkpoint_loads_and_equals_smolvlms_tower():
     with torch.no_grad():
         out = tower.cuda().eval()(x).last_hidden_state
         assert torch.equal(out, ref.to("cuda", torch.bfloat16)(x).last_hidden_state)
+
+
+@pytest.mark.parametrize("scale, side", [(2, 4), (4, 8)])
+def test_pixel_shuffle_equals_smolvlms(scale, side):
+    x = torch.randn(3, side * side, 5)
+    assert torch.equal(pixel_shuffle(x, scale), SmolVLMConnector.pixel_shuffle(None, x, scale))
+    # a 4x4 grid of 1-d patches: token 0 holds the top-left 2x2 block, row by row
+    out = pixel_shuffle(torch.arange(16.0).view(1, 16, 1), 2)
+    assert out.tolist() == [[[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]]]
+
+
+def test_connector_equals_smolvlms():
+    # one namespace serves both: ours reads connector_in_features/text, SmolVLM's vision_config/text_config
+    c = SimpleNamespace(scale_factor=2, connector_in_features=8 * 4, text=SimpleNamespace(hidden_size=6),
+                        vision_config=SimpleNamespace(hidden_size=8), text_config=SimpleNamespace(hidden_size=6))
+    ours, ref = SmolVLAConnector(c), SmolVLMConnector(c)
+    assert [n for n, _ in ours.named_parameters()] == ["proj.weight"]
+    ref.modality_projection.proj.weight.data.copy_(ours.proj.weight)
+    x = torch.randn(2, 16, 8)
+    with torch.no_grad():
+        assert ours(x).shape == (2, 16 // 4, 6) and torch.equal(ours(x), ref(x))
+
+
+ORACLE = Path.home() / "mstar/docs-local/smolvla/oracle/t212-sq-a/tensors.safetensors"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or None in (POLICY_DIR, VLM_DIR) or not ORACLE.exists(),
+                    reason="no GPU, SmolVLA checkpoints or oracle dumps")
+def test_tower_and_connector_equal_lerobots_vision_dump():
+    config = SmolVLAConfig.from_hf(POLICY_DIR, VLM_DIR)
+    tower, connector = siglip_tower(config.vision), SmolVLAConnector(config)
+    for module, component in ((tower, "vision"), (connector, "connector")):
+        module.to("cuda", torch.bfloat16).eval()
+        assert load_smolvla_weights(module, component, POLICY_DIR) == {n for n, _ in module.named_parameters()}
+    dump = load_file(ORACLE, device="cuda")
+    with torch.no_grad():
+        for i in range(3):
+            out = connector(tower(dump[f"prepared.{i}"].to(torch.bfloat16)).last_hidden_state)
+            assert torch.equal(out, dump[f"vision.{i}"]), i
