@@ -98,6 +98,7 @@ def test_reads_both_configs(tmp_path):
     ("num_expert_layers", 8),
     ("n_action_steps", 51),
     ("resize_imgs_with_padding", None),
+    ("resize_imgs_with_padding", [384, 384]),
     ("input_features", {"observation.state": {"type": "STATE", "shape": [6]}}),
     ("rtc_config", {"enabled": True}),
     ("num_vlm_layers", 0),
