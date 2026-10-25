@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 from mstar.model.smolvla.preprocessing import (
@@ -11,6 +12,7 @@ from mstar.model.smolvla.preprocessing import (
     MeanStd,
     load_norm_stats,
     normalize_state,
+    prepare_images,
     tokenize,
     unnormalize_actions,
 )
@@ -56,7 +58,7 @@ def test_normalize_state_then_zero_pads():
     out = normalize_state(x, MeanStd(MEAN, STD, EPS), 32)
     assert out.shape == (4, 2, 32)
     assert torch.equal(out[..., :3], (x - MEAN) / (STD + EPS)) and not out[..., 3:].any()
-    assert torch.equal(normalize_state(x, None, 32), torch.nn.functional.pad(x, (0, 29)))
+    assert torch.equal(normalize_state(x, None, 32), F.pad(x, (0, 29)))
 
 
 def test_unnormalize_slices_to_action_dim_before_unnormalizing():
@@ -65,6 +67,21 @@ def test_unnormalize_slices_to_action_dim_before_unnormalizing():
     out = unnormalize_actions(chunk, MeanStd(MEAN, STD, EPS), 3)
     assert torch.equal(out, chunk[..., :3] * STD + MEAN)
     assert torch.equal(unnormalize_actions(chunk, None, 3), chunk[..., :3])
+
+
+def test_prepare_images_scales_to_fit_and_pads_left_and_top():
+    wide, tall, square = (torch.randint(0, 256, s, dtype=torch.uint8) for s in [(6, 8, 3), (8, 6, 3), (16, 16, 3)])
+    out = prepare_images([wide, tall, square], 16, 16)
+    assert out.shape == (3, 3, 16, 16) and out.dtype == torch.float32
+
+    def scaled(frame, size):
+        return F.interpolate((frame.float() / 255).permute(2, 0, 1)[None], size=size, mode="bilinear",
+                             align_corners=False)[0] * 2 - 1
+
+    # 6x8 and 8x6 scale by 2 to 12x16 and 16x12; the pad is 0 before x * 2 - 1
+    assert torch.equal(out[0, :, 4:], scaled(wide, (12, 16))) and (out[0, :, :4] == -1).all()
+    assert torch.equal(out[1, :, :, 4:], scaled(tall, (16, 12))) and (out[1, :, :, :4] == -1).all()
+    assert torch.equal(out[2], (square.float() / 255).permute(2, 0, 1) * 2 - 1)  # no resize
 
 
 class _Tokenizer:
@@ -114,3 +131,16 @@ def test_matches_lerobots_processors_bitwise():
     ids = tokenize(AutoTokenizer.from_pretrained(VLM), "pick up the red cube and put it in the box", 48)
     mask = base["pre.observation.language.attention_mask"][0]
     assert torch.equal(ids, base["pre.observation.language.tokens"][0][mask])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not all(
+                        (ORACLE / d / "tensors.safetensors").exists() for d in ("c02-sq-a", "c02-wide")),
+                    reason="no GPU or local LeRobot dumps not present")
+@pytest.mark.parametrize("dump", ["c02-sq-a", "c02-wide"])
+def test_prepare_images_matches_lerobot_on_the_gpu_bitwise(dump):
+    t = load_file(ORACLE / dump / "tensors.safetensors")
+    frames = [t[f"input.image.observation.images.camera{i}"] for i in (1, 2, 3)]
+    gpu = prepare_images([f.cuda() for f in frames], 512, 512).cpu()
+    assert torch.equal(gpu, torch.cat([t[f"prepared.{i}"] for i in range(3)]))
+    if dump == "c02-sq-a":  # D07: CUDA's / 255 is u8 * (1/255), so the CPU's division is not the reference
+        assert not torch.equal(prepare_images(frames, 512, 512), gpu)
