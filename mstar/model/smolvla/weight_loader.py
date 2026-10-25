@@ -22,7 +22,7 @@ _EXPERT = "model.vlm_with_expert.lm_expert."
 # component -> (root it strips, checkpoint prefixes it owns)
 COMPONENT_PREFIXES: dict[str, tuple[str, tuple[str, ...]]] = {
     "vision": (_VLM + "vision_model.", (_VLM + "vision_model.",)),
-    "connector": (_VLM + "connector.", (_VLM + "connector.",)),
+    "connector": (_VLM + "connector.modality_projection.", (_VLM + "connector.",)),
     "text": (_VLM + "text_model.", (_VLM + "text_model.",)),
     "state": ("model.", ("model.state_proj.",)),
     "expert": (_EXPERT, (_EXPERT,)),
