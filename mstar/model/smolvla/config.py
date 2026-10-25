@@ -118,7 +118,7 @@ class SmolVLAConfig:
         raw = _read(path)
         vlm = _read(vlm_path)
         tc = vlm["text_config"]
-        _check_supported(raw, tc)
+        _check_supported(raw, tc, vlm["vision_config"])
         text = SmolVLATextConfig(**_known(SmolVLATextConfig, {**tc, "num_hidden_layers": raw["num_vlm_layers"]}))
         width = int(text.hidden_size * raw["expert_width_multiplier"])
         expert = SmolVLAExpertConfig(
@@ -153,7 +153,7 @@ _REQUIRED = {
 }
 
 
-def _check_supported(raw: dict, text_config: dict) -> None:
+def _check_supported(raw: dict, text_config: dict, vision_config: dict) -> None:
     bad = {k: raw.get(k) for k, v in _REQUIRED.items() if raw.get(k, v) != v}
     if raw.get("num_expert_layers", 0) > 0 and raw["num_expert_layers"] != raw["num_vlm_layers"]:
         # LeRobot then shares each expert layer across several VLM layers
@@ -165,6 +165,9 @@ def _check_supported(raw: dict, text_config: dict) -> None:
     if raw.get("resize_imgs_with_padding") is None:
         # LeRobot then skips the resize and feeds images at their own size
         bad["resize_imgs_with_padding"] = None
+    elif tuple(raw["resize_imgs_with_padding"]) != (vision_config["image_size"],) * 2:
+        # SmolVLM buckets other sizes' positions; SigLIP's tower (D09) only matches at its own size
+        bad["resize_imgs_with_padding"] = raw["resize_imgs_with_padding"]
     if not any(v["type"] == "VISUAL" for v in raw["input_features"].values()):
         bad["input_features"] = "no camera"
     if (raw.get("rtc_config") or {}).get("enabled"):
