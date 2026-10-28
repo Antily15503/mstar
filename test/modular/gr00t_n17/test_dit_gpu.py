@@ -38,8 +38,8 @@ from safetensors import safe_open
 
 from mstar.engine.resources.attn.ragged.wrappers import (
     SUPPORTED_HEAD_DIMS,
-    RaggedCrossPrefillWrapper,
-    RaggedPrefillWrapper,
+    FlashInferRaggedCrossPrefillWrapper,
+    FlashInferRaggedPrefillWrapper,
     padded_head_dim,
 )
 from mstar.model.components.diffusion.attention import joint_attention
@@ -264,9 +264,9 @@ class _Spans:
                 q_data_type=_BF16,
             )
 
-        self.own = build(RaggedPrefillWrapper)
-        self.text = build(RaggedCrossPrefillWrapper)
-        self.image = build(RaggedCrossPrefillWrapper)
+        self.own = build(FlashInferRaggedPrefillWrapper)
+        self.text = build(FlashInferRaggedCrossPrefillWrapper)
+        self.image = build(FlashInferRaggedCrossPrefillWrapper)
 
     def plan(self, batch: int, text_rows: int, image_rows: int = _IMAGE) -> dict:
         """Plan one bucket of ``batch`` requests; return the span-to-attention map ``DiT.forward`` takes."""
